@@ -52,6 +52,7 @@ class State(TypedDict, total=False):
     code: str
     tests_passed: bool
     test_output: str
+    tests: list[str]
     review: str
     approved: bool
     rejections: int
@@ -127,18 +128,19 @@ def run_tests(code: str, tests: list[str] | None = None) -> tuple[bool, str]:
 
 
 def check(s: State):
-    """Deterministic gate: actually execute the worker's code against TESTS."""
+    """Deterministic gate: actually execute the worker's code against the tests."""
     code = extract_code(s.get("work", ""))
-    passed, output = run_tests(code)
+    passed, output = run_tests(code, s.get("tests"))
     return {"code": code, "tests_passed": passed, "test_output": output}
 
 
 def reviewer(s: State):
+    tests = s.get("tests") or TESTS
     msg = (
         f"Task: {s['task']}\n"
         f"Plan:\n{s['plan']}\n"
         f"Solution:\n{s['work']}\n\n"
-        f"Automated tests run by the harness:\n" + "\n".join(TESTS) + "\n"
+        f"Automated tests run by the harness:\n" + "\n".join(tests) + "\n"
         f"Test result: {'PASSED' if s.get('tests_passed') else 'FAILED'}\n"
         f"Test output:\n{s.get('test_output', '')}\n\n"
         "Check the solution against the task. Your reply MUST start with the "
@@ -164,16 +166,17 @@ def ask_tai(s: State):
         "review": s["review"],
         "rejections": s["rejections"],
         "test_output": s.get("test_output", ""),
-        "options": "reply stop/accept to end the run, anything else to retry",
+        "options": "reply exactly 'stop' or 'accept' to end the run; "
+                   "anything longer is guidance and retries",
     })
     text = (choice or "").strip()
-    word = re.match(r"[a-z]+", text.lower())
-    word = word.group(0) if word else ""
+    cmd = text.lower().strip(" .!?")
     plan = s["plan"] + "\nOwner call: " + text
 
-    if word in STOP_WORDS:
+    # Whole-reply match only: "accept the assert for now" is guidance, not a decision.
+    if cmd in STOP_WORDS:
         return {"plan": plan, "outcome": f"stopped by owner: {text}"}
-    if word in ACCEPT_WORDS:
+    if cmd in ACCEPT_WORDS:
         return {"plan": plan, "outcome": f"accepted by owner despite failing checks: {text}"}
     return {"plan": plan, "rejections": 0}
 
@@ -234,11 +237,9 @@ def run(task: str, *, tests: list[str] | None = None,
         resume_with: str | None = None, thread: str = "1",
         max_pauses: int | None = None) -> dict:
     """Drive the graph through interrupts until END; returns the final state."""
-    global TESTS
-    if tests is not None:
-        TESTS = tests
     cfg = {"configurable": {"thread_id": thread}}
-    inputs: Any = {"task": task, "rejections": 0}
+    # Tests travel in state, so a --cap run cannot leak into later runs.
+    inputs: Any = {"task": task, "rejections": 0, "tests": tests or TESTS}
     pauses = 0
 
     while True:
