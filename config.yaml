@@ -4,9 +4,9 @@ models:
   worker: ollama:qwen2.5-coder:7b
   reviewer: ollama:qwen2.5-coder:7b
   # Optional. At the rejection cap this model gets one attempt before the owner is asked.
-  # Must differ from the worker to be useful. Pull it first (`ollama pull qwen3:8b`),
-  # then uncomment. Delete the line to turn escalation off.
-  # escalation: ollama:qwen3:8b
+  # Must differ from the worker to be useful (`ollama pull qwen3:8b`).
+  # Delete the line to turn escalation off.
+  escalation: ollama:qwen3:8b
 
 max_rejections: 3
 test_timeout: 15
