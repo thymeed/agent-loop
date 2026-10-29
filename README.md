@@ -113,6 +113,29 @@ requirements: ['six==1.17.0']       # optional; installed at image build time on
 - Limits: Python and pytest only; small models often fail the whole-file format on
   large files; the worker sees about `max_context_chars` of the project per prompt.
 
+## Dashboard
+
+See what the models are doing, live:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_loop.dashboard    # prints a URL with a one-time token
+```
+
+Open that URL in your browser. **Runs** lists every traced run and shows, as it happens,
+each model call with its full prompt and reply, tokens and seconds, the tests' output,
+reviews, pauses and the final patch. **Evals** shows eval reports (including one still
+running), per-attempt detail and a side-by-side comparison of any two.
+
+It is read-only and local: it listens on `127.0.0.1` only (there is no option to change
+that), requires the random token, rejects unexpected `Host` headers, answers `GET` only,
+sends no CORS headers, serves a page whose content-security-policy forbids inline script,
+makes no outside requests, and shows model output as plain text (a test fails if the page
+code ever uses `innerHTML` and friends). It serves only files under `runs/`.
+
+Runs write `runs/<thread>/trace.jsonl` (prompts and replies, with key-shaped strings
+redacted). Those files contain your project code, so they stay local and gitignored.
+Runs made before this feature have no trace; they still appear under Evals.
+
 ## Research mode
 
 `type: research` tasks answer from recent arXiv papers instead of writing code

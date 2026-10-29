@@ -5,7 +5,7 @@ from pathlib import Path
 from langgraph.graph import END
 from langgraph.types import interrupt
 
-from . import research, sandbox, workspace
+from . import research, sandbox, trace, workspace
 from .checks import TESTS, extract_code, run_tests
 from .config import CONFIG, make_llm
 from .state import State, usage
@@ -28,7 +28,7 @@ def lead(s: State):
         "Write a short numbered plan (max 6 steps) to solve the task. "
         "No code, no preamble."
     )
-    resp = MODELS["lead"].invoke(msg)
+    resp = trace.llm_call("lead", MODELS["lead"], msg)
     return {"plan": resp.content.strip(), "tokens": {"lead": usage(resp)}}
 
 
@@ -124,13 +124,13 @@ def _worker_prompt(s: State) -> str:
 
 
 def worker(s: State):
-    resp = MODELS["worker"].invoke(_worker_prompt(s))
+    resp = trace.llm_call("worker", MODELS["worker"], _worker_prompt(s))
     return {"work": resp.content, "tokens": {"worker": usage(resp)}}
 
 
 def escalate(s: State):
     """One attempt by the stronger model at the cap; its tokens are reported separately."""
-    resp = MODELS["escalation"].invoke(_worker_prompt(s))
+    resp = trace.llm_call("escalation", MODELS["escalation"], _worker_prompt(s))
     return {"work": resp.content, "escalated": True, "tokens": {"escalate": usage(resp)}}
 
 
@@ -196,7 +196,7 @@ def reviewer(s: State):
             "Check the solution against the task. Your reply MUST start with the "
             f"single word {APPROVED_TAG} or REJECTED, then a short reason."
         )
-    resp = MODELS["reviewer"].invoke(msg)
+    resp = trace.llm_call("reviewer", MODELS["reviewer"], msg)
     text = resp.content.strip()
     model_ok = text.upper().startswith(APPROVED_TAG)
     tests_ok = bool(s.get("tests_passed"))

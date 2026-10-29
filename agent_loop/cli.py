@@ -1,4 +1,5 @@
 import argparse
+import functools
 import sys
 import tempfile
 import time
@@ -9,7 +10,8 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from .checks import IMPOSSIBLE_TESTS, TESTS
-from . import runs, workspace
+from . import runs, trace, workspace
+from .config import CONFIG
 from .graph import compile_graph, graph
 from .tasks import Task, load_task
 
@@ -39,6 +41,23 @@ def print_tokens(tokens: dict[str, dict[str, int]]) -> None:
           f"{grand['output']:>5d} / {grand['total']:>6d}\n")
 
 
+def _traced(fn):
+    """Record the run to runs/<thread>/trace.jsonl when it has a runs_dir; always release the sink."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kw):
+        runs_dir, thread = kw.get("runs_dir"), kw.get("thread", "1")
+        trace.begin(Path(runs_dir) / thread / "trace.jsonl" if runs_dir is not None else None)
+        try:
+            return fn(*args, **kw)
+        except BaseException as exc:
+            trace.emit("run_error", error=trace.clean(f"{type(exc).__name__}: {exc}", 400))
+            raise
+        finally:
+            trace.begin(None)
+    return wrapper
+
+
+@_traced
 def run(task: str | None, *, tests: list[str] | None = None,
         kind: str = "code", query: str | None = None, max_papers: int = 8,
         resume_with: str | None = None, thread: str = "1",
@@ -67,6 +86,7 @@ def run(task: str | None, *, tests: list[str] | None = None,
         paused = any(t.interrupts for t in snap.tasks)
         inputs = Command(resume=_owner_call(resume_with)) if paused else None
         print(f"continuing {thread!r} at {snap.next}\n")
+        trace.emit("resumed", thread=thread, next=list(snap.next))
     else:
         # Tests travel in state, so a --cap run cannot leak into later runs.
         inputs = {"task": task, "rejections": 0, "type": kind}
@@ -79,6 +99,8 @@ def run(task: str | None, *, tests: list[str] | None = None,
                           protected=list(workspace.DEFAULT_PROTECTED) if protected is None else protected)
         else:
             inputs["tests"] = tests or TESTS
+        trace.emit("run_start", thread=thread, kind=kind, task=trace.clean(task or "", 4000),
+                   models=dict(CONFIG["models"]), max_rejections=CONFIG["max_rejections"])
     pauses = 0
     used = 0
     over_budget = False
@@ -91,8 +113,11 @@ def run(task: str | None, *, tests: list[str] | None = None,
                 if node == "__interrupt__":
                     pauses += 1
                     print(f"PAUSED #{pauses} - owner call needed: {update[0].value}\n")
+                    trace.emit("pause", number=pauses, info=trace.summarize_update(update[0].value))
                 else:
                     print_step(node, update)
+                    trace.emit("node", node=node, seconds=round(now - clock, 2),
+                               update=trace.summarize_update(update))
                     if timings is not None:
                         timings[node] = timings.get(node, 0.0) + (now - clock)
                     used += sum(c.get("total", 0) for c in (update or {}).get("tokens", {}).values())
@@ -130,11 +155,17 @@ def run(task: str | None, *, tests: list[str] | None = None,
               f"runs/{thread}, then from your project: git apply <path to changes.patch>")
     if runs_dir is not None and values:
         print(f"saved {runs.write_record(runs_dir, thread, values, pauses)}")
+    trace.emit("run_end", result=runs.result_label(values), approved=bool(values.get("approved")),
+               tests_passed=bool(values.get("tests_passed")), rejections=values.get("rejections"),
+               outcome=values.get("outcome"), pauses=pauses, changed=values.get("changed"),
+               patch=values.get("patch"), tokens=values.get("tokens", {}))
     return values
 
 
 def _owner_call(resume_with: str | None) -> str:
-    return resume_with if resume_with is not None else input("Owner call: ").strip()
+    answer = resume_with if resume_with is not None else input("Owner call: ").strip()
+    trace.emit("owner_call", text=trace.clean(answer, 500))
+    return answer
 
 
 def expand_task_files(paths: list[str]) -> list[str]:

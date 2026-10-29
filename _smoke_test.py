@@ -1303,6 +1303,286 @@ def test_thread_ids_stay_plain():
     assert runs.valid_thread(runs.new_thread_id("some task!! name")), "generated ids are always valid"
 
 
+FAKE_KEY = "sk-" + "B" * 24
+
+
+def _traced_run(root, *, reply=GOOD, thread="demo", resume="stop", tests=None):
+    install(code=reply)
+    return cli.run("is_palindrome", tests=tests or checks.TESTS, thread=thread,
+                   runs_dir=root, resume_with=resume)
+
+
+def _events(root, thread="demo"):
+    import json
+    lines = (root / thread / "trace.jsonl").read_text(encoding="utf-8").split(NL)
+    return [json.loads(x) for x in lines if x]
+
+
+def test_trace_records_what_each_model_was_asked_and_said():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    _traced_run(root)
+    ev = _events(root)
+    kinds = [e["event"] for e in ev]
+    assert kinds[0] == "run_start" and kinds[-1] == "run_end", kinds
+    for role in ("lead", "worker", "reviewer"):
+        starts = [e for e in ev if e["event"] == "llm_start" and e["role"] == role]
+        ends = [e for e in ev if e["event"] == "llm_end" and e["role"] == role]
+        assert len(starts) == len(ends) == 1, (role, kinds)
+        assert starts[0]["prompt"] and ends[0]["reply"] and ends[0]["tokens"]["total_tokens"] == 15
+        assert kinds.index("llm_start") <= ev.index(starts[0])
+    worker_end = next(e for e in ev if e["event"] == "llm_end" and e["role"] == "worker")
+    assert "def is_palindrome" in worker_end["reply"], worker_end
+    check = next(e for e in ev if e["event"] == "node" and e["node"] == "check")
+    assert check["update"]["tests_passed"] is True and "ALL TESTS PASSED" in check["update"]["test_output"]
+    assert "work" not in check["update"] and "tokens" not in check["update"], "bulky fields are not repeated"
+    end = ev[-1]
+    assert end["result"] == "approved" and end["approved"] and end["tokens"]["worker"]["calls"] == 1, end
+    assert all(isinstance(e["ts"], float) for e in ev) and ev == sorted(ev, key=lambda e: e["ts"])
+
+
+def test_trace_covers_pauses_owner_calls_errors_and_turns_off_afterwards():
+    import pathlib, tempfile
+    from agent_loop import trace
+    root = pathlib.Path(tempfile.mkdtemp())
+    _traced_run(root, reply=BROKEN, thread="capped", tests=checks.TESTS)
+    kinds = [e["event"] for e in _events(root, "capped")]
+    assert "pause" in kinds and "owner_call" in kinds and kinds[-1] == "run_end", kinds
+    assert kinds.index("pause") < kinds.index("owner_call") < kinds.index("run_end")
+    assert _events(root, "capped")[-1]["result"] == "stopped by owner"
+    assert trace._sink is None, "the sink is released after a run"
+
+    class Boom:
+        def invoke(self, msg):
+            raise RuntimeError("model fell over")
+
+    install()
+    agent_nodes.MODELS["worker"] = Boom()
+    try:
+        cli.run("is_palindrome", thread="crash", runs_dir=root, resume_with="stop")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the error must still propagate")
+    crash = _events(root, "crash")
+    assert any(e["event"] == "llm_error" for e in crash) and crash[-1]["event"] == "run_error", crash
+    assert trace._sink is None, "the sink is released even when the run crashes"
+
+    install()
+    cli.run("is_palindrome", thread="untraced", resume_with="stop")          # no runs_dir: no trace
+    assert not (root / "untraced").exists()
+
+
+def test_trace_redacts_key_shaped_strings_and_cuts_huge_text():
+    import pathlib, tempfile
+    from agent_loop import trace
+    root = pathlib.Path(tempfile.mkdtemp())
+    leaky = GOOD + NL + f"API_KEY = '{FAKE_KEY}'" + NL + "x" * (trace.MAX_TEXT + 500)
+    _traced_run(root, reply=leaky, thread="leaky")
+    text = (root / "leaky" / "trace.jsonl").read_text(encoding="utf-8")
+    assert FAKE_KEY not in text and "[redacted]" in text, "key-shaped strings never reach the trace"
+    reply = next(e for e in _events(root, "leaky") if e["event"] == "llm_end" and e["role"] == "worker")["reply"]
+    assert len(reply) < trace.MAX_TEXT + 100 and "chars, cut" in reply, len(reply)
+
+
+class _Client:
+    """A bare HTTP client against the dashboard, with full control over headers."""
+
+    def __init__(self, server, token="testtoken"):
+        self.server, self.token = server, token
+
+    def request(self, method, path, headers=None, cookie=True, host=None):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=5)
+        hdrs = {"Host": host or f"127.0.0.1:{self.server.port}"}
+        if cookie:
+            hdrs["Cookie"] = f"dash={self.token}"
+        hdrs.update(headers or {})
+        conn.request(method, path, headers=hdrs)
+        resp = conn.getresponse()
+        body = resp.read()
+        out = (resp.status, {k.lower(): v for k, v in resp.getheaders()}, body)
+        conn.close()
+        return out
+
+    def get_json(self, path, **kw):
+        import json
+        status, headers, body = self.request("GET", path, **kw)
+        return status, json.loads(body or b"null"), headers
+
+
+@contextlib.contextmanager
+def _dashboard(root):
+    import threading
+    from agent_loop import dashboard
+    server = dashboard.Dashboard(root, port=0, token="testtoken")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield _Client(server)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_dashboard_listens_on_loopback_only_and_nobody_else_can_take_the_port():
+    import pathlib, tempfile
+    from agent_loop import dashboard
+    with _dashboard(pathlib.Path(tempfile.mkdtemp())) as c:
+        assert c.server.server_address[0] == "127.0.0.1", c.server.server_address
+        try:
+            dashboard.Dashboard(pathlib.Path(tempfile.mkdtemp()), port=c.server.port)
+        except OSError:
+            pass
+        else:
+            raise AssertionError("a second program must not be able to bind the same port")
+
+
+def test_dashboard_needs_the_token_the_right_host_and_only_allows_get():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    _traced_run(root)
+    with _dashboard(root) as c:
+        for path in ("/", "/api/runs", "/api/trace?id=demo&after=0", "/app.js"):
+            assert c.request("GET", path, cookie=False)[0] == 403, path           # no token
+            assert c.request("GET", path, headers={"Cookie": "dash=wrong"}, cookie=False)[0] == 403, path
+        assert c.request("GET", "/?t=wrong", cookie=False)[0] == 403
+        assert c.request("GET", "/api/runs?t=testtoken", cookie=False)[0] == 403, "the URL token only works on /"
+
+        status, headers, _ = c.request("GET", "/?t=testtoken", cookie=False)
+        assert status == 302 and headers["location"] == "/" and "testtoken" not in headers["location"], headers
+        cookie = headers["set-cookie"]
+        assert "HttpOnly" in cookie and "SameSite=Strict" in cookie and "Path=/" in cookie, cookie
+        assert c.request("GET", "/")[0] == 200
+
+        # DNS-rebinding defence: right cookie, wrong Host
+        for host in ("evil.example", "evil.example:80", "127.0.0.1:1", "127.0.0.1", "0.0.0.0:%d" % c.server.port):
+            assert c.request("GET", "/api/runs", host=host)[0] == 403, host
+        assert c.request("GET", "/api/runs", host=f"localhost:{c.server.port}")[0] == 200
+
+        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+            status, headers, _ = c.request(method, "/api/runs")
+            assert status == 405 and headers["allow"] == "GET", (method, status)
+            assert not any(k.startswith("access-control") for k in headers), "no CORS, ever"
+
+
+def test_dashboard_responses_carry_a_strict_policy_and_never_allow_cross_origin_reads():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    _traced_run(root)
+    with _dashboard(root) as c:
+        for path in ("/", "/app.js", "/app.css", "/api/runs", "/api/evals", "/missing"):
+            status, headers, _ = c.request("GET", path)
+            csp = headers["content-security-policy"]
+            assert "script-src 'self'" in csp and "default-src 'none'" in csp and "frame-ancestors 'none'" in csp, csp
+            assert "unsafe-inline" not in csp and "unsafe-eval" not in csp and "http" not in csp, csp
+            assert headers["x-content-type-options"] == "nosniff" and headers["cache-control"] == "no-store"
+            assert headers["x-frame-options"] == "DENY" and headers["referrer-policy"] == "no-referrer"
+            assert headers["cross-origin-resource-policy"] == "same-origin"
+            assert not any(k.startswith("access-control") for k in headers), path
+        assert c.request("GET", "/api/runs")[1]["content-type"].startswith("application/json")
+
+
+def test_dashboard_page_files_cannot_inject_markup_or_pull_in_anything_remote():
+    import pathlib, re
+    web = pathlib.Path(__file__).resolve().parent / "agent_loop" / "web"
+    js, html, css = [(web / n).read_text(encoding="utf-8") for n in ("app.js", "index.html", "app.css")]
+    for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function",
+                   "srcdoc", "javascript:", ".href", "setAttribute(\"href\"", "setAttribute(\"src\"",
+                   "setAttribute(\"style\"", "style:", "XMLHttpRequest", "WebSocket", "import("):
+        assert banned not in js, f"app.js uses {banned}"
+    assert not re.search(r"https?://", js + html + css), "the page must not reference any remote address"
+    assert "style=" not in html and not re.search(r"<script(?![^>]*\ssrc=)", html), "no inline script or style"
+    assert not re.search(r"\son[a-z]+\s*=", html), "no inline event handlers"
+    assert "@import" not in css and "url(" not in css
+
+
+def test_dashboard_lists_runs_pages_traces_and_refuses_hostile_ids():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    html_attack = '<script>alert(1)</script></pre><img src=x onerror=alert(1)>'
+    _traced_run(root, reply=html_attack + NL + GOOD)
+    (root / "demo" / "changes.patch").write_bytes(("--- a/x" + NL + "+++ b/x" + NL).encode("utf-8"))
+    secret = root.parent / "outside-secret"
+    secret.mkdir(exist_ok=True)
+    (secret / "trace.jsonl").write_text('{"event":"llm_end","reply":"TOP SECRET"}' + NL, encoding="utf-8")
+    with _dashboard(root) as c:
+        status, data, _ = c.get_json("/api/runs")
+        run = next(r for r in data["runs"] if r["id"] == "demo")
+        assert run["status"] == "finished" and run["result"] == "approved" and run["calls"] == 3, run
+        assert run["kind"] == "code" and run["models"], run
+
+        status, first, headers = c.get_json("/api/trace?id=demo&after=0")
+        assert status == 200 and first["total"] == len(_events(root)) and first["next"] == first["total"], first
+        status, rest, _ = c.get_json("/api/trace?id=demo&after=4")
+        assert rest["events"] == first["events"][4:], "paging by index returns exactly the later events"
+        status, tail, _ = c.get_json(f"/api/trace?id=demo&after={first['total']}")
+        assert status == 200 and tail["events"] == [], tail
+
+        # hostile model output is only ever JSON data, never a page
+        worker = next(e for e in first["events"] if e["event"] == "llm_end" and e["role"] == "worker")
+        assert html_attack in worker["reply"] and headers["content-type"].startswith("application/json")
+        assert headers["x-content-type-options"] == "nosniff"
+
+        assert c.get_json("/api/patch?id=demo")[1]["patch"].startswith("--- a/x")
+        assert c.get_json("/api/trace?id=demo&after=abc")[0] == 400
+        assert c.get_json("/api/trace?id=demo&after=-1")[0] == 400
+
+        outside = "../" + secret.name
+        for ident in (outside, "demo/../../" + secret.name, "%2e%2e/" + secret.name, "..%2f" + secret.name,
+                      "/etc/passwd", "C:/Windows/win.ini", "demo%5C..%5Cx", "demo/..", ".", "", "evals",
+                      "demo/trace.jsonl", "a/b/c/d/e/f", "demo;x", "demo%00", "x" * 400):
+            status, body, _ = c.get_json("/api/trace?id=" + ident + "&after=0")
+            assert status in (400, 404) and "TOP SECRET" not in str(body), (ident, status)
+        assert c.request("GET", "/../agent_loop/config.py")[0] == 404
+        assert c.request("GET", "/app.js/../../config.yaml")[0] == 404
+        assert b"TOP SECRET" not in c.request("GET", "/api/trace?id=" + outside)[2]
+
+
+def test_dashboard_shows_a_run_that_is_still_being_written():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    d = root / "live"
+    d.mkdir()
+    start = '{"ts": 1.0, "event": "run_start", "kind": "code", "task": "t", "models": {}}'
+    ask = '{"ts": 2.0, "event": "llm_start", "role": "worker", "model": "m", "prompt": "p"}'
+    (d / "trace.jsonl").write_bytes((start + NL + ask + NL + '{"ts": 3.0, "event": "llm_en').encode("utf-8"))
+    with _dashboard(root) as c:
+        run = next(r for r in c.get_json("/api/runs")[1]["runs"] if r["id"] == "live")
+        assert run["status"] == "running" and run["thinking"] is True and run["events"] == 2, run
+        assert c.get_json("/api/trace?id=live&after=0")[1]["total"] == 2, "a half-written line is not served"
+        with open(d / "trace.jsonl", "ab") as f:
+            f.write(b'd", "role": "worker", "reply": "r", "seconds": 1.0, "tokens": {}}' + b"\n")
+        run = next(r for r in c.get_json("/api/runs")[1]["runs"] if r["id"] == "live")
+        assert run["events"] == 3 and run["thinking"] is False, run
+        (d / "trace.jsonl").write_bytes((start + NL + "this is not json" + NL).encode("utf-8"))
+        assert c.get_json("/api/trace?id=live&after=0")[1]["total"] == 1, "a corrupt line is skipped, not fatal"
+
+
+def test_dashboard_serves_eval_reports_and_comparisons_by_validated_name():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    files = _eval_tasks(tmp)
+    install()
+    agent_nodes.MODELS["worker"] = PromptLLM(lambda m: BROKEN if "BADTASK" in m else GOOD)
+    first, p1 = evals.run_eval(files, 1, "alpha", out_root=root / "evals", progress=lambda *_: None)
+    second, p2 = evals.run_eval(files, 2, "beta", out_root=root / "evals", progress=lambda *_: None)
+    with _dashboard(root) as c:
+        reports = c.get_json("/api/evals")[1]["reports"]
+        assert {r["name"] for r in reports} == {p1.name, p2.name}, reports
+        assert all(r["finished"] for r in reports)
+        status, data, _ = c.get_json("/api/eval?name=" + p2.name)
+        rows = {r["task"]: r for r in data["summary"]}
+        assert rows["good"]["passes"] == 2 and rows["bad"]["passes"] == 0 and data["report"]["label"] == "beta"
+        status, data, _ = c.get_json(f"/api/compare?a={p1.name}&b={p2.name}")
+        assert status == 200 and "A = alpha   B = beta" in data["text"], data
+        for bad in ("../" + p1.name, "nope.json", "..%2fx.json", p1.name + "/", "a.json%00", "", "x" * 300 + ".json"):
+            assert c.get_json("/api/eval?name=" + bad)[0] == 404, bad
+        assert c.get_json("/api/compare?a=" + p1.name + "&b=nope.json")[0] == 404
+
+
 def test_non_cp1252_code_and_output_do_not_crash_the_check():
     """Windows decodes subprocess text with cp1252; model code can print anything."""
     snowman = chr(0x2603)

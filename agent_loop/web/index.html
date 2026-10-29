@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-loop dashboard</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top">
+  <h1>agent-loop</h1>
+  <nav>
+    <button id="tab-runs" class="tab on" type="button">Runs</button>
+    <button id="tab-evals" class="tab" type="button">Evals</button>
+  </nav>
+  <span class="note">read-only &middot; this machine only</span>
+</header>
+
+<main id="view-runs" class="split">
+  <aside id="run-list" aria-label="runs"></aside>
+  <section id="run-view">
+    <p class="muted">Pick a run on the left.</p>
+  </section>
+</main>
+
+<main id="view-evals" class="split" hidden>
+  <aside id="eval-list" aria-label="eval reports"></aside>
+  <section id="eval-view">
+    <p class="muted">Pick an eval report on the left. Tick two to compare them.</p>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
