@@ -16,3 +16,7 @@ sandbox: docker
 sandbox_image: python:3.12-slim
 sandbox_memory: 256m
 sandbox_cpus: 1
+
+# type: project tasks: pytest on a read-only workspace in the same kind of container
+project_memory: 512m
+project_test_timeout: 120

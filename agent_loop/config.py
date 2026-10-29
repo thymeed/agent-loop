@@ -15,6 +15,8 @@ DEFAULTS = {
     "sandbox_image": "python:3.12-slim",
     "sandbox_memory": "256m",
     "sandbox_cpus": 1,
+    "project_memory": "512m",
+    "project_test_timeout": 120,
 }
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"

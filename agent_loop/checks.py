@@ -50,14 +50,14 @@ def _execute(script: str) -> subprocess.CompletedProcess:
     """Run the script in the configured sandbox. May raise TimeoutExpired/OSError."""
     if SANDBOX == "local":
         return subprocess.run(
-            [sys.executable, "-I", "-c", script],
-            capture_output=True, text=True, timeout=TEST_TIMEOUT, check=False,
+            [sys.executable, "-X", "utf8", "-I", "-c", script],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=TEST_TIMEOUT, check=False,
         )
     name = f"agent-loop-{uuid.uuid4().hex[:12]}"
     try:
         return subprocess.run(
             _docker_cmd(name), input=script,
-            capture_output=True, text=True, timeout=TEST_TIMEOUT, check=False,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=TEST_TIMEOUT, check=False,
         )
     except subprocess.TimeoutExpired:
         # Killing the docker client leaves the container running; stop it by name.

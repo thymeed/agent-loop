@@ -9,7 +9,7 @@ from unittest import mock
 
 from langgraph.types import Command
 
-from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes, research, workspace
+from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes, research, sandbox, workspace
 from agent_loop.tasks import Task, load_task
 
 NL = chr(10)
@@ -508,6 +508,159 @@ def test_no_personal_data_in_repo_files():
 
 def _docker_mode():
     return mock.patch.object(checks, "SANDBOX", "docker")
+
+
+def test_requirement_validation_rejects_anything_but_plain_specifiers():
+    ok = ["six==1.17.0", "requests[socks]>=2,<3", "numpy", "Flask~=3.0", "a.b-c_d != 1.0"]
+    assert sandbox.validate_requirements(ok) == [r.strip() for r in ok]
+    for bad in ["-r other.txt", "-e .", "--index-url http://evil", "https://evil/x.whl",
+                "git+https://github.com/x/y", "pkg @ https://evil/x.whl", "pkg; python_version<'3'",
+                "pkg==1.0 && rm -rf /", "pkg==$(id)", "", "./local", "pkg==1.0\nevil"]:
+        try:
+            sandbox.validate_requirements([bad])
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+    a, b = sandbox.image_tag(["b==1", "a==2"]), sandbox.image_tag(["a==2", "b==1"])
+    assert a == b and a != sandbox.image_tag(["a==2"]), "tag depends on the set, not the order"
+
+
+def test_project_docker_command_is_locked_down_with_a_readonly_mount():
+    import pathlib, tempfile
+    ws = pathlib.Path(tempfile.mkdtemp())
+    cmd = sandbox.project_docker_cmd("n1", ws, "img", "pytest -q tests")
+    joined = " ".join(cmd)
+    for flag in ("--network none", "--read-only", "--cap-drop ALL", "no-new-privileges",
+                 "--pids-limit", "--memory", "--user 65534", "target=/work,readonly", "-w /work"):
+        assert flag in joined, (flag, joined)
+    assert cmd[-6:] == ["pytest", "-p", "no:cacheprovider", "-q", "tests"][-6:] or \
+        cmd[cmd.index("img") + 1:] == ["pytest", "-p", "no:cacheprovider", "-q", "tests"], cmd
+    assert cmd.count("--mount") == 1 and "-v" not in cmd and "--volume" not in cmd
+    assert "/var/run/docker.sock" not in joined
+    try:
+        sandbox.project_docker_cmd("n", ws, "img", "   ")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("empty test command must be rejected")
+
+
+def test_project_tests_build_once_fail_closed_and_kill_on_timeout():
+    import pathlib, tempfile
+    ws = pathlib.Path(tempfile.mkdtemp())
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")      # not built yet
+        if cmd[:2] == ["docker", "build"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:2] == ["docker", "run"]:
+            return SimpleNamespace(returncode=0, stdout="3 passed", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with _docker_mode(), mock.patch.object(sandbox.subprocess, "run", fake_run):
+        ok, out = sandbox.run_project_tests(ws, "pytest", ["six==1.17.0"])
+    assert ok and out == "3 passed", out
+    kinds = [c[1] for c in calls]
+    assert kinds == ["image", "build", "run"], kinds
+    build = calls[1]
+    assert "BASE=python:3.12-slim" in build and build.index("-t") < len(build) - 1, build
+
+    # hostile requirement never reaches docker
+    calls.clear()
+    with _docker_mode(), mock.patch.object(sandbox.subprocess, "run", fake_run):
+        ok, out = sandbox.run_project_tests(ws, "pytest", ["--index-url http://evil"])
+    assert not ok and "plain requirement" in out and not calls, (out, calls)
+
+    # failed build fails closed, no run
+    def failing_build(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0 if cmd[1] != "build" and cmd[1] != "image" else 1,
+                               stdout="", stderr="boom")
+    calls.clear()
+    with _docker_mode(), mock.patch.object(sandbox.subprocess, "run", failing_build):
+        ok, out = sandbox.run_project_tests(ws, "pytest", [])
+    assert not ok and "build failed" in out and all(c[1] != "run" for c in calls), (out, calls)
+
+    # timeout kills the container by name
+    calls.clear()
+
+    def hang(cmd, **kw):
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            raise subprocess.TimeoutExpired(cmd, 1)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    with _docker_mode(), mock.patch.object(sandbox.subprocess, "run", hang):
+        ok, out = sandbox.run_project_tests(ws, "pytest", [])
+    run = next(c for c in calls if c[:2] == ["docker", "run"])
+    assert not ok and "timeout" in out and calls[-1] == ["docker", "kill", run[run.index("--name") + 1]], calls
+
+    # local mode is refused for real projects; missing docker fails closed
+    with mock.patch.object(checks, "SANDBOX", "local"):
+        assert "need `sandbox: docker`" in sandbox.run_project_tests(ws, "pytest", [])[1]
+
+    def no_docker(cmd, **kw):
+        raise FileNotFoundError("docker")
+    with _docker_mode(), mock.patch.object(sandbox.subprocess, "run", no_docker):
+        ok, out = sandbox.run_project_tests(ws, "pytest", [])
+    assert not ok and "install Docker" in out, out
+
+
+def test_non_cp1252_code_and_output_do_not_crash_the_check():
+    """Windows decodes subprocess text with cp1252; model code can print anything."""
+    snowman = chr(0x2603)
+    code = "def f():" + NL + f"    print('{snowman} caf' + chr(0xe9) + ' ' + chr(0x1F600))" + NL + "    return 1"
+    ok, out = checks.run_tests(code, ["assert f() == 1", "assert f() == 2"])
+    assert not ok and "AssertionError" in out, out          # failed cleanly, did not raise
+    ok, out = checks.run_tests(f"def f():{NL}    return '{snowman}'", ["assert f() == chr(0x2603)"])
+    assert ok, out                                           # unicode source also survives stdin
+
+
+def _docker_up():
+    import shutil
+    return bool(shutil.which("docker")) and subprocess.run(
+        ["docker", "info"], capture_output=True).returncode == 0
+
+
+def test_real_docker_project_sandbox():
+    """Fixture project: fails, passes after a fix, cannot write to /work, needs no network."""
+    import pathlib, tempfile
+    if not _docker_up():
+        print("  (docker not available - skipped)")
+        return
+    root = pathlib.Path(tempfile.mkdtemp())
+    ws = _project(root / "ws", {
+        "calc.py": "def add(a, b):" + NL + "    return a - b" + NL,
+        "test_calc.py": "from calc import add" + NL + "def test_add():" + NL + "    assert add(2, 3) == 5" + NL,
+        "test_sandbox.py": NL.join([
+            "import socket, pathlib",
+            "def test_cannot_write_to_workspace():",
+            "    try:",
+            "        pathlib.Path('/work/pwned.txt').write_text('x')",
+            "    except OSError:",
+            "        return",
+            "    raise AssertionError('workspace is writable')",
+            "def test_no_network():",
+            "    try:",
+            "        socket.create_connection(('1.1.1.1', 53), timeout=2)",
+            "    except OSError:",
+            "        return",
+            "    raise AssertionError('network reachable')", ""]),
+    })
+    with _docker_mode():
+        ok, out = sandbox.run_project_tests(ws, "pytest -q", [])
+        assert not ok and "1 failed" in out and "test_add" in out, out     # buggy add() is caught
+        assert "test_cannot_write_to_workspace" not in out and "test_no_network" not in out, out
+
+        workspace.apply_blocks(ws, "`" * 3 + "calc.py" + NL + "def add(a, b):" + NL + "    return a + b" + NL + "`" * 3)
+        ok, out = sandbox.run_project_tests(ws, "pytest -q", [])
+        assert ok and "3 passed" in out, out
+    assert not (ws / "pwned.txt").exists() and not (ws / ".pytest_cache").exists()
+    left = subprocess.run(["docker", "ps", "-a", "--filter", "name=agent-loop-", "--format", "{{.Names}}"],
+                          capture_output=True, text=True).stdout.split()
+    assert not left, left
 
 
 def test_docker_command_is_locked_down():
