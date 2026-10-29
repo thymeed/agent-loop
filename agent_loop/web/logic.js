@@ -107,6 +107,11 @@
           else it.error = String(e.error || "error");
           break;
         }
+        case "llm_retry": {
+          const it = (waiting[String(e.role)] || [])[0];
+          if (it) it.retries = (it.retries || 0) + 1;
+          break;
+        }
         case "node":
           items.push({ kind: "node", node: String(e.node), ts: num(e.ts), seconds: num(e.seconds), update: e.update || {} });
           break;

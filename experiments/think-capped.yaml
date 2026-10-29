@@ -1,0 +1,5 @@
+# Escalation model thinks, but its reasoning is captured separately (clean answer) and capped.
+model_options:
+  escalation:
+    reasoning: true
+    num_predict: 4096

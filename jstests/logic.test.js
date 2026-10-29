@@ -99,6 +99,17 @@ check("buildItems merges start/end per role in order and keeps unfinished calls 
   assert.equal(L.buildItems([{ event: "llm_start", role: "w", ts: 1 }, { event: "llm_error", role: "w", seconds: 1, error: "boom" }])[0].error, "boom");
 });
 
+check("a retried call stays one item and remembers it was retried", () => {
+  const items = L.buildItems([
+    { ts: 1, event: "llm_start", role: "worker", model: "m", prompt: "p" },
+    { ts: 2, event: "llm_retry", role: "worker", wait: 5, error: "CUDA error" },
+    { ts: 8, event: "llm_end", role: "worker", seconds: 7, reply: "r", tokens: { total_tokens: 3 } },
+  ]);
+  assert.equal(items.length, 1);
+  assert.deepEqual([items[0].retries, items[0].done, items[0].reply], [1, true, "r"]);
+  assert.doesNotThrow(() => L.buildItems([{ event: "llm_retry", role: "ghost" }]));
+});
+
 check("outcome and category classify items", () => {
   const items = L.buildItems(EVENTS);
   const checks_ = items.filter((i) => i.kind === "node" && i.node === "check").map(L.outcome);

@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -19,7 +20,29 @@ STOP_WORDS = {"stop", "quit", "end", "halt", "abort"}
 ACCEPT_WORDS = {"accept", "approve", "ship"}
 
 # One chat model per role; tests swap entries for fakes.
-MODELS = {role: make_llm(spec) for role, spec in CONFIG["models"].items()}
+MODELS = {role: make_llm(spec, CONFIG["model_options"].get(role)) for role, spec in CONFIG["models"].items()}
+
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)  # never closed: a token cap cut it off
+_THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
+
+
+def strip_think(text: str) -> str:
+    """The reply without the model's reasoning.
+
+    Thinking models (qwen3 and friends) return their reasoning inside <think> tags unless the
+    client separates it. Reasoning often contains draft code blocks, so it must never be parsed
+    for answers: file blocks inside it would otherwise be written to the workspace."""
+    text = _THINK_BLOCK.sub("", text or "")
+    text = _THINK_OPEN.sub("", text)
+    parts = _THINK_CLOSE.split(text)  # a lone closing tag: everything before it was reasoning
+    return parts[-1].strip()
+
+
+def answer_text(resp) -> str:
+    """What a model actually answered: its reply with the reasoning removed."""
+    return strip_think(str(resp.content))
 
 
 def lead(s: State):
@@ -29,7 +52,7 @@ def lead(s: State):
         "No code, no preamble."
     )
     resp = trace.llm_call("lead", MODELS["lead"], msg)
-    return {"plan": resp.content.strip(), "tokens": {"lead": usage(resp)}}
+    return {"plan": answer_text(resp), "tokens": {"lead": usage(resp)}}
 
 
 def search(s: State):
@@ -125,13 +148,13 @@ def _worker_prompt(s: State) -> str:
 
 def worker(s: State):
     resp = trace.llm_call("worker", MODELS["worker"], _worker_prompt(s))
-    return {"work": resp.content, "tokens": {"worker": usage(resp)}}
+    return {"work": answer_text(resp), "tokens": {"worker": usage(resp)}}
 
 
 def escalate(s: State):
     """One attempt by the stronger model at the cap; its tokens are reported separately."""
     resp = trace.llm_call("escalation", MODELS["escalation"], _worker_prompt(s))
-    return {"work": resp.content, "escalated": True, "tokens": {"escalate": usage(resp)}}
+    return {"work": answer_text(resp), "escalated": True, "tokens": {"escalate": usage(resp)}}
 
 
 def check(s: State):
@@ -197,7 +220,7 @@ def reviewer(s: State):
             f"single word {APPROVED_TAG} or REJECTED, then a short reason."
         )
     resp = trace.llm_call("reviewer", MODELS["reviewer"], msg)
-    text = resp.content.strip()
+    text = answer_text(resp)
     model_ok = text.upper().startswith(APPROVED_TAG)
     tests_ok = bool(s.get("tests_passed"))
     if model_ok and not tests_ok:

@@ -73,7 +73,8 @@ def new_report(label: str, attempts: int, budget: int | None) -> dict:
     return {
         "label": label,
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "config": {"models": dict(CONFIG["models"]), "num_ctx": CONFIG["num_ctx"],
+        "config": {"models": dict(CONFIG["models"]), "model_options": dict(CONFIG["model_options"]),
+                   "override": CONFIG["override"], "num_ctx": CONFIG["num_ctx"],
                    "max_rejections": CONFIG["max_rejections"], "sandbox": CONFIG["sandbox"]},
         "attempts": attempts,
         "budget": budget,
@@ -234,6 +235,8 @@ def main() -> None:
     preflight()
     only = {n.strip() for n in args.only.split(",") if n.strip()} if args.only else None
     print(f"models: {CONFIG['models']}")
+    if CONFIG["model_options"] or CONFIG["override"]:
+        print(f"options: {CONFIG['model_options']}   patch: {CONFIG['override']}")
     report, path = run_eval(files, args.attempts, args.label, budget=args.budget, only=only)
     print("\n" + format_table(summarize(report["results"])))
     print(f"\nreport: {path.relative_to(runs.RUNS_DIR.parent)}")

@@ -1,0 +1,4 @@
+# Escalation model with thinking switched off.
+model_options:
+  escalation:
+    reasoning: false

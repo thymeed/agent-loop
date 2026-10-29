@@ -1,11 +1,14 @@
-"""Read-only local dashboard for runs and evals.
+"""Local dashboard for runs and evals: read-only, plus one narrow write.
 
     python -m agent_loop.dashboard          # prints the URL to open
 
-It only reads files under runs/. It listens on 127.0.0.1 and nothing else, requires a random
-per-launch token (kept in a cookie after the first visit), checks the Host header against
-DNS rebinding, answers GET only, sends no CORS headers, and serves a page whose CSP blocks
-inline scripts. Everything a model wrote is data in JSON and shown as text, never as HTML.
+It reads files under runs/. The only thing it can write is an owner reply (POST
+/api/owner_reply) to a run that is paused and waiting: one small JSON file inside that run's own
+folder. It listens on 127.0.0.1 and nothing else, requires a random per-launch token (kept in a
+cookie after the first visit), checks the Host header against DNS rebinding, accepts the write
+only with an exact Origin, the per-launch CSRF header and a matching pause nonce, answers every
+other request with GET only, sends no CORS headers, and serves a page whose CSP blocks inline
+scripts. Everything a model wrote is data in JSON and shown as text, never as HTML.
 """
 import argparse
 import hmac
@@ -290,7 +293,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "internal error"}, 500)
 
     def _method_not_allowed(self):
-        self._send(405, b"read-only", "text/plain; charset=utf-8", {"Allow": "GET"})
+        self._send(405, b"method not allowed", "text/plain; charset=utf-8", {"Allow": "GET"})
 
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _method_not_allowed
 
@@ -413,7 +416,7 @@ def main() -> None:
     except OSError as exc:
         raise SystemExit(f"could not listen on 127.0.0.1:{args.port} ({exc}); try --port 0")
     url = f"http://127.0.0.1:{server.port}/?t={server.token}"
-    print(f"dashboard (read-only, this machine only): {url}\nCtrl+C to stop", flush=True)
+    print(f"dashboard (this machine only; can answer paused runs): {url}\nCtrl+C to stop", flush=True)
     if args.open:
         webbrowser.open(url)
     try:

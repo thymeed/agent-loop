@@ -1151,12 +1151,12 @@ def test_run_eval_budget_stops_an_attempt_and_errors_do_not_stop_the_eval():
 def test_config_override_and_model_preflight():
     import pathlib, tempfile
     from agent_loop import config
-    assert config.config_path({}) == config.DEFAULT_CONFIG_PATH
+    assert config.override_path({}) is None
     alt = pathlib.Path(tempfile.mkdtemp()) / "alt.yaml"
     alt.write_text("models:" + NL + "  worker: ollama:other:1b" + NL, encoding="utf-8")
-    assert config.config_path({"AGENT_LOOP_CONFIG": str(alt)}) == alt.resolve()
+    assert config.override_path({"AGENT_LOOP_CONFIG": str(alt)}) == alt.resolve()
     try:
-        config.config_path({"AGENT_LOOP_CONFIG": str(alt.parent / "typo.yaml")})
+        config.override_path({"AGENT_LOOP_CONFIG": str(alt.parent / "typo.yaml")})
     except FileNotFoundError:
         pass
     else:
@@ -2090,6 +2090,264 @@ def test_the_page_has_exactly_one_way_to_write_and_it_is_the_owner_reply():
     assert js.count("/api/owner_reply") == 1 and "X-CSRF" in js and "same-origin" in js
     assert len(re.findall(r"\bfetch\(", js)) == 2, "a read helper and the single write"
     assert "localStorage" not in js and "sessionStorage" not in js and "document.cookie" not in js
+
+
+class _ServerError(Exception):
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _FlakyLLM:
+    """Fails with the given errors in order, then answers."""
+
+    def __init__(self, errors):
+        self.errors, self.calls = list(errors), 0
+
+    def invoke(self, msg):
+        self.calls += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return SimpleNamespace(content="fine", usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+
+
+def test_a_transient_server_error_is_retried_exactly_once():
+    import pathlib, tempfile
+    from agent_loop import trace
+    path = pathlib.Path(tempfile.mkdtemp()) / "t" / "trace.jsonl"
+
+    def attempt(errors):
+        model = _FlakyLLM(errors)
+        trace.begin(path)
+        try:
+            with mock.patch.object(trace, "RETRY_WAIT", 0):
+                try:
+                    return model, trace.llm_call("worker", model, "prompt"), None
+                except Exception as exc:
+                    return model, None, exc
+        finally:
+            trace.begin(None)
+
+    model, resp, error = attempt([_ServerError("CUDA error: an illegal memory access", 500)])
+    assert error is None and resp.content == "fine" and model.calls == 2
+    kinds = [e["event"] for e in _events(path.parent.parent, "t")]
+    assert kinds == ["llm_start", "llm_retry", "llm_end"], kinds        # one call, visibly retried
+    assert "CUDA" in next(e for e in _events(path.parent.parent, "t") if e["event"] == "llm_retry")["error"]
+
+    path.unlink()
+    model, resp, error = attempt([_ServerError("boom", 500), _ServerError("boom again", 503)])
+    assert resp is None and "boom again" in str(error) and model.calls == 2, "a second failure is not retried"
+    assert [e["event"] for e in _events(path.parent.parent, "t")] == ["llm_start", "llm_retry", "llm_error"]
+
+    for errors in ([_ServerError("bad request", 400)], [_ServerError("not found", 404)], [ValueError("plain")],
+                   [_ServerError("odd", True)], [_ServerError("odd", "500")]):
+        path.unlink()
+        model, resp, error = attempt(errors)
+        assert resp is None and error is not None and model.calls == 1, errors      # never retried
+        assert "llm_retry" not in [e["event"] for e in _events(path.parent.parent, "t")]
+
+
+def test_eval_fixtures_match_their_pin():
+    from agent_loop import fixtures
+    assert fixtures.pinned() is not None, "evals/FIXTURES.sha256 is missing"
+    assert fixtures.digest() == fixtures.pinned(), (
+        "an eval fixture changed, so earlier eval reports are no longer comparable; if that is intended run "
+        "python -m agent_loop.fixtures --update")
+
+
+def test_fixture_digest_notices_real_edits_but_not_line_endings_or_caches():
+    import pathlib, shutil, tempfile
+    from agent_loop import fixtures
+    root = pathlib.Path(tempfile.mkdtemp()) / "evals"
+    shutil.copytree(fixtures.EVALS, root, ignore=shutil.ignore_patterns("__pycache__"))
+    base = fixtures.digest(root)
+    assert base == fixtures.digest(fixtures.EVALS), "a copy of the fixtures hashes the same"
+
+    target = root / "projects" / "csvrow" / "tests" / "test_parse.py"
+    original = target.read_bytes()
+    target.write_bytes(original.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    assert fixtures.digest(root) == base, "a Windows checkout (CRLF) must hash like a Linux one"
+    target.write_bytes(original)
+
+    (root / "projects" / "csvrow" / "__pycache__").mkdir()
+    (root / "projects" / "csvrow" / "__pycache__" / "x.cpython-312.pyc").write_bytes(b"junk")
+    (root / "projects" / "csvrow" / "stray.pyc").write_bytes(b"junk")
+    (root / "FIXTURES.sha256").write_text("anything", encoding="utf-8")
+    assert fixtures.digest(root) == base, "caches, bytecode and the pin file itself are ignored"
+
+    target.write_bytes(original + b"# edit" + b"\n")
+    assert fixtures.digest(root) != base, "a changed test must change the digest"
+    target.write_bytes(original)
+    (root / "new.yaml").write_text("task: x", encoding="utf-8")
+    assert fixtures.digest(root) != base, "a new task must change the digest"
+    (root / "new.yaml").unlink()
+    shutil.move(str(root / "fizzbuzz.yaml"), str(root / "fizzbuzz2.yaml"))
+    assert fixtures.digest(root) != base, "a renamed file must change the digest"
+    shutil.move(str(root / "fizzbuzz2.yaml"), str(root / "fizzbuzz.yaml"))
+    assert fixtures.digest(root) == base, "undoing every change restores the digest"
+
+
+def _cfg(tmp, name, text):
+    path = tmp / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_model_options_are_whitelisted_and_type_checked():
+    import pathlib, tempfile
+    from agent_loop import config
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    base = "models:" + NL + "  escalation: ollama:qwen3:8b" + NL + "  worker: ollama:qwen2.5-coder:7b" + NL
+
+    ok = config.load_config(_cfg(tmp, "ok.yaml", base + "model_options:" + NL + "  escalation:" + NL +
+                                 "    reasoning: false" + NL + "    num_predict: 4096" + NL + "    temperature: 0.2" + NL), env={})
+    assert ok["model_options"] == {"escalation": {"reasoning": False, "num_predict": 4096, "temperature": 0.2}}
+    assert config.load_config(_cfg(tmp, "none.yaml", base), env={})["model_options"] == {}
+
+    for bad in (
+        "    think: false",                      # not an allowed option (typo for reasoning)
+        "    reasoning: 'yes'", "    reasoning: 1", "    reasoning: null",
+        "    num_predict: 0", "    num_predict: 99999", "    num_predict: true", "    num_predict: '5'", "    num_predict: 1.5",
+        "    temperature: -1", "    temperature: 3", "    temperature: hot",
+        "    base_url: http://evil.example", "    num_ctx: 99999999", "    keep_alive: -1", "    seed: 1",
+    ):
+        try:
+            config.load_config(_cfg(tmp, "bad.yaml", base + "model_options:" + NL + "  escalation:" + NL + bad + NL), env={})
+        except ValueError as exc:
+            assert "escalation" in str(exc), exc
+        else:
+            raise AssertionError(f"accepted {bad.strip()}")
+    for body in ("model_options:" + NL + "  ghost:" + NL + "    reasoning: false",       # role with no model
+                 "model_options:" + NL + "  escalation: nope",                           # options must be a mapping
+                 "models:" + NL + "  escalation: other:model" + NL + "model_options:" + NL + "  escalation:" + NL + "    reasoning: false"):
+        try:
+            config.load_config(_cfg(tmp, "bad2.yaml", (base if "models:" not in body else "") + body + NL), env={})
+        except ValueError:
+            continue
+        raise AssertionError(body)
+
+
+def test_an_experiment_patch_layers_over_the_real_config_key_by_key():
+    import pathlib, tempfile
+    from agent_loop import config
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    base = _cfg(tmp, "base.yaml", NL.join([
+        "models:", "  escalation: ollama:qwen3:8b", "  worker: ollama:qwen2.5-coder:7b",
+        "model_options:", "  escalation:", "    reasoning: true", "    num_predict: 100", "max_rejections: 5", ""]))
+    patch = _cfg(tmp, "patch.yaml", NL.join(["model_options:", "  escalation:", "    reasoning: false", ""]))
+    plain = config.load_config(base, env={})
+    layered = config.load_config(base, env={"AGENT_LOOP_CONFIG": str(patch)})
+    assert plain["override"] is None and layered["override"] == "patch.yaml"
+    assert layered["model_options"] == {"escalation": {"reasoning": False, "num_predict": 100}}, "merged per option"
+    assert layered["models"] == plain["models"] and layered["max_rejections"] == 5, "everything else comes from config.yaml"
+    assert plain["model_options"]["escalation"]["reasoning"] is True, "the base is not changed by layering"
+
+    swap = _cfg(tmp, "swap.yaml", "models:" + NL + "  escalation: ollama:other:3b" + NL)
+    assert config.load_config(base, env={"AGENT_LOOP_CONFIG": str(swap)})["models"]["escalation"] == "ollama:other:3b"
+    empty = _cfg(tmp, "empty.yaml", "# nothing\\n")
+    assert config.load_config(base, env={"AGENT_LOOP_CONFIG": str(empty)})["model_options"] == plain["model_options"]
+    for text in ("- a list", "just text"):
+        try:
+            config.load_config(base, env={"AGENT_LOOP_CONFIG": str(_cfg(tmp, "odd.yaml", text))})
+        except (ValueError, AttributeError):
+            continue
+        raise AssertionError(text)
+    # a patch cannot slip past the safety gates
+    unsafe = _cfg(tmp, "unsafe.yaml", "sandbox: local" + NL)
+    try:
+        config.load_config(base, env={"AGENT_LOOP_CONFIG": str(unsafe)})
+    except ValueError as exc:
+        assert "NO isolation" in str(exc), exc
+    else:
+        raise AssertionError("an experiment patch must not be able to turn the sandbox off")
+    try:
+        config.load_config(base, env={"AGENT_LOOP_CONFIG": str(tmp / "missing.yaml")})
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("a missing patch must be an error, not a silent control run")
+
+
+def test_options_reach_only_the_roles_that_list_them_and_reports_record_them():
+    from agent_loop import config
+    thinker = config.make_llm("ollama:qwen3:8b", {"reasoning": False, "num_predict": 4096, "temperature": 0.1})
+    assert thinker.reasoning is False and thinker.num_predict == 4096 and thinker.temperature == 0.1
+    plain = config.make_llm("ollama:gemma3:4b")
+    assert plain.reasoning is None and plain.num_predict is None, "a model with no options gets no think setting"
+    assert plain.num_ctx == config.CONFIG["num_ctx"]
+    assert config.make_llm("ollama:x:1b", {}).reasoning is None
+    assert set(agent_nodes.MODELS) >= {"lead", "worker", "reviewer"}
+    report = evals.new_report("opts", 1, None)
+    assert report["config"]["model_options"] == config.CONFIG["model_options"]
+    assert "override" in report["config"]
+
+
+def test_the_shipped_experiment_files_change_only_what_they_say():
+    import pathlib
+    from agent_loop import config
+    experiments = pathlib.Path(__file__).resolve().parent / "experiments"
+    base = config.load_config(config.CONFIG_PATH, env={})
+    results = {p.stem: config.load_config(config.CONFIG_PATH, env={"AGENT_LOOP_CONFIG": str(p)})
+               for p in sorted(experiments.glob("*.yaml"))}
+    assert sorted(results) == ["control", "think-capped", "think-off"], sorted(results)
+    for name, cfg in results.items():
+        assert cfg["models"] == base["models"], f"{name} must not change models"
+        assert {k: v for k, v in cfg.items() if k not in ("model_options", "override")} == \
+            {k: v for k, v in base.items() if k not in ("model_options", "override")}, f"{name} changes more than model options"
+    assert results["control"]["model_options"] == base["model_options"]
+    assert results["think-off"]["model_options"]["escalation"] == {"reasoning": False}
+    assert results["think-capped"]["model_options"]["escalation"] == {"reasoning": True, "num_predict": 4096}
+    assert all(set(cfg["model_options"]) <= {"escalation"} for cfg in results.values()), "only the escalation role is touched"
+
+
+def test_strip_think_removes_reasoning_but_nothing_else():
+    strip = agent_nodes.strip_think
+    assert strip("plain answer") == "plain answer"
+    assert strip("<think>hmm</think>answer") == "answer"
+    assert strip("<think>a" + NL + "b</think>" + NL + NL + "answer" + NL) == "answer"
+    assert strip("<think>one</think>mid<think>two</think>end") == "midend"
+    assert strip("<THINK>x</THINK>ok") == "ok"
+    assert strip("") == "" and strip(None) == ""
+    fenced = "`" * 3 + "calc.py" + NL + "x = 1" + NL + "`" * 3
+    assert strip("<think>never finished " + fenced) == "", "a reply cut off mid-thought has no answer"
+    assert strip("reasoning only</think>the answer") == "the answer", "a lone closing tag ends the reasoning"
+    assert strip("<think>" + fenced + "</think>" + fenced) == fenced, "only the answer's blocks survive"
+    assert strip("a < b and c > d, no tags here") == "a < b and c > d, no tags here"
+
+
+def test_file_blocks_inside_reasoning_are_never_applied():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    draft = FENCE + "scratch_notes.py" + NL + "print('draft')" + NL + FENCE
+    wrong = FENCE + "calc.py" + NL + "def add(a, b):" + NL + "    return 0" + NL + FENCE
+    reply = "<think>First I will try this:" + NL + draft + NL + wrong + NL + "no, that is wrong</think>" + NL + FIX
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _fake_project_tests([])):
+        orig, values = _project_run(root, worker=SeqLLM([reply]), thread="thinks")
+    ws = root / "runs" / "thinks" / "workspace"
+    assert values["approved"] and values["rejections"] == 0, values
+    assert not (ws / "scratch_notes.py").exists(), "a draft inside the reasoning must not be written"
+    assert "a + b" in (ws / "calc.py").read_text(encoding="utf-8")
+    assert values["changed"] == ["calc.py"] and "<think>" not in values["work"], values["changed"]
+    raw = next(e for e in _events(root / "runs", "thinks") if e["event"] == "llm_end" and e["role"] == "worker")["reply"]
+    assert raw.startswith("<think>"), "the trace keeps the full reply so the thinking stays visible"
+
+
+def test_a_reply_cut_off_inside_its_reasoning_is_an_ordinary_rejection():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    worker = SeqLLM(["<think>still thinking about it " + FIX, FIX])          # lap 1 never closed its <think>
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _fake_project_tests([])):
+        _, values = _project_run(root, worker=worker, thread="cutoff")
+    assert values["approved"] and values["rejections"] == 1, values
+    assert "no file blocks" in worker.prompts[1], "the worker is told it produced no files"
+
+
+def test_lead_and_reviewer_replies_are_read_without_their_reasoning():
+    install(review="<think>the tests passed, so</think>APPROVED: fine")
+    agent_nodes.MODELS["lead"] = FakeLLM("<think>plan the plan</think>1. The real plan")
+    values = cli.run("is_palindrome", tests=checks.TESTS, thread="clean-roles")
+    assert values["approved"] is True and values["plan"] == "1. The real plan", values
+    assert values["review"].startswith("APPROVED"), values["review"]
 
 
 def test_tests_keep_their_scratch_files_inside_the_project():

@@ -333,9 +333,9 @@
         return card(it, "", "Run started · " + it.runKind, "", [...block("task", it.task), ...block("models", JSON.stringify(it.models, null, 2))], false);
       case "resumed": return card(it, "pause", "Resumed", "", []);
       case "llm": {
-        const meta = it.done ? (it.error ? "failed after " + L.formatSeconds(it.seconds)
+        const meta = (it.retries ? "retried after a server error · " : "") + (it.done ? (it.error ? "failed after " + L.formatSeconds(it.seconds)
           : L.formatSeconds(it.seconds) + " · " + L.formatCount((it.tokens || {}).total_tokens || 0) + " tokens")
-          : "thinking… " + Math.max(0, Math.round(serverNow() - it.ts)) + "s";
+          : "thinking… " + Math.max(0, Math.round(serverNow() - it.ts)) + "s");
         const kids = [...block("prompt", it.prompt)];
         if (it.reply !== null) kids.push(...block("reply", it.reply));
         if (it.error) kids.push(...block("error", it.error));
@@ -544,6 +544,9 @@
     setChildren(view, 
       el("h2", {}, data.report.label || name),
       el("p", { class: "muted" }, "models " + Object.entries(data.report.config.models).map(([k, v]) => k + "=" + v.replace(/^ollama:/, "")).join(", ")
+        + (Object.keys(data.report.config.model_options || {}).length
+          ? " · options " + Object.entries(data.report.config.model_options).map(([r, o]) => r + " " + JSON.stringify(o)).join("; ") : "")
+        + (data.report.config.override ? " · patch " + data.report.config.override : "")
         + " · budget " + (data.report.budget || "none") + " · " + (data.report.finished ? "finished" : "not finished")),
       compare,
       el("div", { class: "grid" },

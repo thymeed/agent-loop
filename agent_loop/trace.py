@@ -44,16 +44,34 @@ def emit(event: str, **fields) -> None:
             f.write(line + "\n")
 
 
+RETRY_WAIT = 5.0  # seconds before the one retry of a transient server error
+
+
+def _transient(exc: Exception) -> bool:
+    """A server-side failure (5xx) such as Ollama's occasional CUDA error: worth one more try."""
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and not isinstance(status, bool) and status in (500, 502, 503, 504)
+
+
 def llm_call(role: str, model, prompt: str):
-    """model.invoke(prompt), recorded as llm_start / llm_end (or llm_error)."""
+    """model.invoke(prompt), recorded as llm_start / llm_end (or llm_error).
+
+    A transient server error is retried exactly once, after a short wait, and the retry is
+    recorded as llm_retry. Any other error, or a second failure, propagates."""
     emit("llm_start", role=role, model=CONFIG["models"].get(role, "?"), prompt=clean(prompt))
     started = time.monotonic()
-    try:
-        resp = model.invoke(prompt)
-    except Exception as exc:
-        emit("llm_error", role=role, seconds=round(time.monotonic() - started, 2),
-             error=clean(f"{type(exc).__name__}: {exc}", 400))
-        raise
+    for attempt in (1, 2):
+        try:
+            resp = model.invoke(prompt)
+            break
+        except Exception as exc:
+            if attempt == 1 and _transient(exc):
+                emit("llm_retry", role=role, wait=RETRY_WAIT, error=clean(f"{type(exc).__name__}: {exc}", 400))
+                time.sleep(RETRY_WAIT)
+                continue
+            emit("llm_error", role=role, seconds=round(time.monotonic() - started, 2),
+                 error=clean(f"{type(exc).__name__}: {exc}", 400))
+            raise
     meta = getattr(resp, "usage_metadata", None) or {}
     emit("llm_end", role=role, seconds=round(time.monotonic() - started, 2), reply=clean(resp.content),
          tokens={k: int(meta.get(k) or 0) for k in ("input_tokens", "output_tokens", "total_tokens")})

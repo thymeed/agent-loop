@@ -113,6 +113,36 @@ requirements: ['six==1.17.0']       # optional; installed at image build time on
 - Limits: Python and pytest only; small models often fail the whole-file format on
   large files; the worker sees about `max_context_chars` of the project per prompt.
 
+## Evals
+
+Measure instead of guessing. `evals/` holds six fixed tasks with deterministic tests: two code
+tasks and four small projects. Ollama must be running with the configured models pulled (the
+harness checks first).
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_loop.evals --attempts 3 --label baseline --budget 40000
+.\.venv\Scripts\python.exe -m agent_loop.evals --compare runs\evals\<a>.json runs\evals\<b>.json
+```
+
+- Each attempt runs without a terminal (the owner call at the cap is `stop`), in its own thread,
+  and the report `runs/evals/<label>-<timestamp>.json` is saved after every attempt, with a trace
+  per attempt beside it. A failed attempt is recorded and the rest continue.
+- `--only a,b` picks tasks, `--attempts N` repeats each, `--budget TOKENS` stops an attempt at the
+  first node boundary after its total passes that number.
+- **Experiments are small patches.** `AGENT_LOOP_CONFIG` names a YAML file layered over
+  `config.yaml` (models and `model_options` merge key by key), so it holds only the difference.
+  `experiments/` has `control`, `think-off` and `think-capped`. In PowerShell:
+  `$env:AGENT_LOOP_CONFIG = "experiments\think-off.yaml"`. A patch cannot turn the sandbox off or
+  use an unknown option. Per-role `model_options` allow `reasoning`, `num_predict` and
+  `temperature` only; a thinking model's reasoning is stripped from its answer before use.
+- **Fixtures are frozen on purpose.** `evals/projects/slugify` is a copy of `projects/slugify_demo`
+  so editing the demo cannot change eval numbers. `evals/FIXTURES.sha256` pins everything under
+  `evals/`; the test suite fails if a fixture changes until you run
+  `python -m agent_loop.fixtures --update`, because earlier reports are no longer comparable after
+  a change.
+- Read the numbers with care: at 3-5 attempts per task, one flipped attempt moves a task by 20-33
+  points. Treat differences of that size as noise and repeat before trusting them.
+
 ## Dashboard
 
 See what the models are doing, live, and answer a paused run from the page:
@@ -243,5 +273,11 @@ Windows drives and interop turned off, ideally with rootless Docker.
 ## Layout
 
 - `loop.py` — entry point.
-- `config.yaml` — per-role models (`provider:model`), rejection cap, test timeout.
-- `agent_loop/` — `state.py`, `checks.py`, `nodes.py`, `graph.py`, `cli.py`, `config.py`.
+- `config.yaml` — per-role models (`provider:model`), per-role `model_options`, caps, timeouts, sandbox.
+- `agent_loop/` — the graph and its nodes (`state.py`, `nodes.py`, `graph.py`, `cli.py`), the checks
+  (`checks.py`, `research.py`, `sandbox.py`, `workspace.py`), `config.py`, `tasks.py`, run records and
+  traces (`runs.py`, `trace.py`, `mailbox.py`), evals (`evals.py`, `fixtures.py`) and the dashboard
+  (`dashboard.py` with `web/`).
+- `tasks/`, `projects/` — example tasks and the demo project. `evals/` — frozen eval fixtures.
+  `experiments/` — config patches for evals. `sandbox/Dockerfile` — the project test image.
+- `_smoke_test.py`, `jstests/` — Python and page-logic tests.
