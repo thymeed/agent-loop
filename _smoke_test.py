@@ -42,11 +42,18 @@ class FakeLLM:
         )
 
 
-def install(*, code=GOOD, review="APPROVED: fine"):
-    """Point the graph at fake models; returns the (worker, reviewer) fakes."""
+def install(*, code=GOOD, review="APPROVED: fine", escalation=None):
+    """Point the graph at fake models; returns the (worker, reviewer) fakes.
+
+    Escalation is off unless `escalation` code is given; its fake is MODELS["escalation"].
+    """
     agent_nodes.MODELS["lead"] = FakeLLM("1. Do it")
     agent_nodes.MODELS["worker"] = FakeLLM(code)
     agent_nodes.MODELS["reviewer"] = FakeLLM(review)
+    if escalation is None:
+        agent_nodes.MODELS.pop("escalation", None)
+    else:
+        agent_nodes.MODELS["escalation"] = FakeLLM(escalation)
     return agent_nodes.MODELS["worker"], agent_nodes.MODELS["reviewer"]
 
 
@@ -278,6 +285,93 @@ def test_research_run_end_to_end_with_fakes():
         assert not run["approved"] and run["outcome"].startswith("stopped by owner"), run
         assert "quote not found" in run["test_output"], run
         assert worker.calls == agent_nodes.MAX_REJECTIONS, worker.calls
+
+
+def test_run_survives_restart_via_sqlite():
+    import json, pathlib, tempfile
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    d = pathlib.Path(tempfile.mkdtemp())
+    db = str(d / "c.sqlite")
+
+    install()
+    with SqliteSaver.from_conn_string(db) as saver:
+        app = graph_mod.compile_graph(saver)
+        cli.run("is_palindrome", tests=checks.IMPOSSIBLE_TESTS, max_pauses=1,
+                thread="t", app=app)
+
+    # fresh connection, fresh graph, fresh fake models: everything must come off disk
+    install()
+    with SqliteSaver.from_conn_string(db) as saver:
+        app = graph_mod.compile_graph(saver)
+        done = cli.run(None, thread="t", app=app, continue_thread=True,
+                       resume_with="stop", runs_dir=d / "runs")
+        assert done["outcome"].startswith("stopped by owner"), done
+        try:
+            cli.run(None, thread="t", app=app, continue_thread=True)
+        except SystemExit as exc:
+            assert "nothing to resume" in str(exc), exc
+        else:
+            raise AssertionError("a finished thread must not resume")
+
+    rec = json.loads((d / "runs" / "t.json").read_text(encoding="utf-8"))
+    assert rec["result"] == "stopped by owner" and rec["rejections"] == agent_nodes.MAX_REJECTIONS, rec
+    assert rec["tokens"]["lead"]["calls"] == 1, rec["tokens"]  # the first run's lead call survived
+    assert rec["tokens"]["worker"]["calls"] == agent_nodes.MAX_REJECTIONS, rec["tokens"]
+
+
+def test_run_record_labels_and_batch_expansion():
+    import pathlib, tempfile
+    from agent_loop import runs
+    assert runs.result_label({"approved": True, "tests_passed": True}) == "approved"
+    assert runs.result_label({"outcome": "accepted by owner despite failing checks: ship"}) == "accepted by owner despite failing checks"
+    assert runs.result_label({"approved": False}) == "unfinished"
+    assert runs.new_thread_id("my task!") .startswith("my-task-")
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "b.yaml").write_text("x", encoding="utf-8")
+    (d / "a.yaml").write_text("x", encoding="utf-8")
+    (d / "skip.txt").write_text("x", encoding="utf-8")
+    assert [pathlib.Path(f).name for f in cli.expand_task_files([str(d)])] == ["a.yaml", "b.yaml"]
+    assert cli.expand_task_files(["tasks/fizzbuzz.yaml"]) == ["tasks/fizzbuzz.yaml"]
+    try:
+        cli.expand_task_files([str(tempfile.mkdtemp())])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("an empty task directory must be an error")
+
+
+def test_escalation_rescues_a_stuck_run():
+    worker, _ = install(code=BROKEN, escalation=GOOD)
+    nodes, state = drive("esc-win", tests=checks.TESTS)
+    assert nodes.count("__interrupt__") == 0, nodes   # the owner was never bothered
+    assert nodes.count("escalate") == 1 and nodes[-1] == "reviewer", nodes
+    assert state.values["approved"] and state.values["tests_passed"], state.values
+    assert worker.calls == agent_nodes.MAX_REJECTIONS, worker.calls
+    tokens = state.values["tokens"]
+    assert tokens["escalate"]["calls"] == 1 and tokens["worker"]["calls"] == agent_nodes.MAX_REJECTIONS, tokens
+
+
+def test_escalation_runs_once_per_cap_then_asks_owner():
+    worker, _ = install(code=BROKEN, escalation=BROKEN)
+    esc = agent_nodes.MODELS["escalation"]
+    nodes, state = drive("esc-lose", resume="stop", tests=checks.TESTS)
+    assert nodes.count("escalate") == 1 and nodes.count("__interrupt__") == 1, nodes
+    assert nodes.index("escalate") < nodes.index("__interrupt__"), nodes
+    assert esc.calls == 1 and worker.calls == agent_nodes.MAX_REJECTIONS, (esc.calls, worker.calls)
+    assert state.values["outcome"].startswith("stopped by owner"), state.values
+
+    # guidance resets the cap, so the next cap earns the stronger model another attempt
+    worker, _ = install(code=BROKEN, escalation=BROKEN)
+    esc = agent_nodes.MODELS["escalation"]
+    nodes, _ = drive("esc-guided", resume="try harder", stop_after_pauses=2, tests=checks.TESTS)
+    assert nodes.count("escalate") == 2 and esc.calls == 2, (nodes, esc.calls)
+
+
+def test_no_escalation_without_a_configured_model():
+    worker, _ = install(code=BROKEN)
+    nodes, _ = drive("no-esc", resume="stop", tests=checks.TESTS)
+    assert "escalate" not in nodes, nodes
 
 
 def _docker_mode():

@@ -9,7 +9,8 @@ and a local Ollama model (`gemma3:4b`).
   asserts, storing `tests_passed` / `test_output`.
 - `reviewer` sees the task, solution, and real test results. A model "APPROVED"
   cannot override a failing run — `route` requires `tests_passed` to finish.
-- After 3 rejections the graph pauses at `ask_tai`. A reply that is *exactly*
+- After 3 rejections an optional stronger model gets one attempt (see Escalation),
+  then the graph pauses at `ask_tai`. A reply that is *exactly*
   `stop` or `accept` (case and trailing punctuation ignored) ends the run and
   records an `outcome`; anything longer is guidance, resets the counter, and
   sends it back for another lap.
@@ -23,6 +24,34 @@ and a local Ollama model (`gemma3:4b`).
 .\.venv\Scripts\python.exe loop.py --max-pauses 1        # pause once and exit
 .\.venv\Scripts\python.exe _smoke_test.py                # offline checks, no Ollama needed
 ```
+
+More than one task, or a directory, runs them one after another and prints a summary:
+
+```powershell
+.\.venv\Scripts\python.exe loop.py tasks --resume stop
+```
+
+## Saved runs and resuming
+
+Everything lands in `runs/` (gitignored). `runs/checkpoints.sqlite` holds the graph
+state after every node, and `runs/<thread>.json` is the final record of a run: result,
+answer, review, test output and the token table. The thread id defaults to
+`<task>-<timestamp>`; set your own with `--thread`.
+
+If a run is killed, or stopped with `--max-pauses`, pick it up later, even from a new
+process (it asks the owner call again if it was paused at one):
+
+```powershell
+.\.venv\Scripts\python.exe loop.py --continue <thread>
+```
+
+## Escalation
+
+When a task hits the rejection cap, the model under `escalation:` in `config.yaml`
+(`ollama:qwen2.5-coder:7b`) gets one attempt, with the same prompt and the same
+`check`, before the owner is asked. Its tokens show on their own `escalate` row. An
+owner reply that is guidance resets the cap and earns another escalation. Delete the
+`escalation:` line to turn it off.
 
 `_smoke_test.py` is also pytest-ready (`def test_*()` functions), so `pytest`
 will collect it in CI.

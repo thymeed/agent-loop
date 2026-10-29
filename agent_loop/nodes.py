@@ -41,9 +41,9 @@ def after_lead(s: State):
     return "search" if is_research(s) else "worker"
 
 
-def worker(s: State):
+def _worker_prompt(s: State) -> str:
     if is_research(s):
-        msg = (
+        return (
             f"Task: {s['task']}\n"
             f"Plan: {s['plan']}\n"
             f"Papers (your ONLY allowed source):\n{research.format_papers(s['sources'])}\n\n"
@@ -54,15 +54,23 @@ def worker(s: State):
             'in double quotes in the same paragraph. Every paper you cite needs at least one '
             "such quote. Do not use outside knowledge and do not cite other papers."
         )
-    else:
-        msg = (
-            f"Task: {s['task']}\n"
-            f"Plan: {s['plan']}\n"
-            f"Last review: {s.get('review', 'none')}\n"
-            "Write the solution."
-        )
-    resp = MODELS["worker"].invoke(msg)
+    return (
+        f"Task: {s['task']}\n"
+        f"Plan: {s['plan']}\n"
+        f"Last review: {s.get('review', 'none')}\n"
+        "Write the solution."
+    )
+
+
+def worker(s: State):
+    resp = MODELS["worker"].invoke(_worker_prompt(s))
     return {"work": resp.content, "tokens": {"worker": usage(resp)}}
+
+
+def escalate(s: State):
+    """One attempt by the stronger model at the cap; its tokens are reported separately."""
+    resp = MODELS["escalation"].invoke(_worker_prompt(s))
+    return {"work": resp.content, "escalated": True, "tokens": {"escalate": usage(resp)}}
 
 
 def check(s: State):
@@ -130,7 +138,7 @@ def ask_tai(s: State):
         return {"plan": plan, "outcome": f"stopped by owner: {text}"}
     if cmd in ACCEPT_WORDS:
         return {"plan": plan, "outcome": f"accepted by owner despite failing checks: {text}"}
-    return {"plan": plan, "rejections": 0}
+    return {"plan": plan, "rejections": 0, "escalated": False}
 
 
 def after_ask(s: State):
@@ -143,5 +151,7 @@ def route(s: State):
     if s.get("approved") and s.get("tests_passed"):
         return END
     if s.get("rejections", 0) >= MAX_REJECTIONS:
+        if "escalation" in MODELS and not s.get("escalated"):
+            return "escalate"
         return "ask_tai"
     return "worker"

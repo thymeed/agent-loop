@@ -25,6 +25,7 @@ class State(TypedDict):
     max_papers: NotRequired[int]
     sources: list[dict]        # research: fetched arXiv papers
     approved: bool
+    escalated: bool            # stronger model already tried at this cap
     rejections: int
     outcome: str
     # node name -> {"input": n, "output": n, "total": n, "calls": n}, summed
