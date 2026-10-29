@@ -1,8 +1,12 @@
 # agent-loop
 
 Lead → worker → check → reviewer loop with a 3-rejection cap, built on LangGraph
-and local Ollama models: `gemma3:4b` plans, `qwen2.5-coder:7b` writes and reviews
-(set per role in `config.yaml`).
+and local Ollama models: `gemma3:4b` plans, `qwen2.5-coder:7b` writes and reviews, and
+`qwen3:8b` gets one escalation attempt at the cap (set per role in `config.yaml`).
+Three kinds of task share the loop: **code** (a function checked by asserts), **project**
+(changes to a real directory, checked by its own pytest) and **research** (answers checked
+against fetched arXiv abstracts). Model output is never trusted: everything it writes runs in
+a locked-down Docker sandbox, and deterministic checks, not the models, decide what passes.
 
 - `lead` writes a short plan.
 - `worker` writes a solution (code in a fenced block).
@@ -32,7 +36,8 @@ Needs Ollama (with the models above pulled) and Docker running.
 .\.venv\Scripts\python.exe loop.py tasks/fizzbuzz.yaml   # your own task (see below)
 .\.venv\Scripts\python.exe loop.py --cap --resume stop   # force the cap, then end as owner
 .\.venv\Scripts\python.exe loop.py --max-pauses 1        # pause once and exit
-.\.venv\Scripts\python.exe _smoke_test.py                # offline checks, no Ollama needed
+.\.venv\Scripts\python.exe -m pytest _smoke_test.py -q   # tests: fake models, no Ollama; Docker tests run if Docker is up
+node jstests\logic.test.js                               # the dashboard page's logic (needs Node)
 ```
 
 More than one task, or a directory, runs them one after another and prints a summary:
@@ -58,11 +63,50 @@ process (it asks the owner call again if it was paused at one):
 ## Escalation
 
 When a task hits the rejection cap, the model under `escalation:` in `config.yaml`
-gets one attempt, with the same prompt and the same
-`check`, before the owner is asked. Its tokens show on their own `escalate` row. An
-owner reply that is guidance resets the cap and earns another escalation. Delete the
-`escalation:` line to turn it off. It ships commented out: pull a model that differs
-from the worker (`ollama pull qwen3:8b`) and uncomment it.
+(`qwen3:8b`) gets one attempt, with the same prompt and the same `check`, before the owner is
+asked. Its tokens show on their own `escalate` row. An owner reply that is guidance resets the
+cap and earns another escalation. Delete the `escalation:` line to turn it off; pull the model
+first with `ollama pull qwen3:8b`, and it should differ from the worker to be worth anything.
+
+Its thinking is **off** (`model_options: escalation: reasoning: false`), which follows from the
+experiment below. When a thinking model does think, its reasoning is stripped from the reply
+before anything is parsed, so draft file blocks inside it can never reach the workspace; the
+dashboard still shows the full text.
+
+### Escalation findings (2026-10-29)
+
+Question: is `qwen3:8b`'s thinking worth its cost as the escalation model? Three variants ran one
+after another on the three tasks that actually reach escalation (`csvrow`, `slugify`, `intervals`),
+5 attempts each (15 per variant), `--budget 40000`. The rule was fixed before running: adopt a
+variant only if its pass count is at most 2 below the control's **and** its mean seconds are at
+least 30% lower.
+
+| variant | passes | mean seconds | mean tokens | escalated, then rescued | rule |
+|---|---|---|---|---|---|
+| thinking default (control) | 10/15 | 90.4 | 7,257 | 5, then 1 | |
+| thinking off | 9/15 | 30.0 | 5,081 | 7, then 2 | adopted |
+| thinking on, capped at 4,096 tokens | 7/15 | 62.3 | 6,869 | 8, then 0 | not adopted: 3 below |
+
+What it shows, and what it does not:
+
+- The saving is almost all one task. `csvrow` escalations took 233 s with default thinking and
+  7 s with it off, and none rescued anything in any variant: 0 of 15 `csvrow` attempts passed
+  (0 of 3 in the earlier baseline too). That task is beyond both models here.
+- On `slugify` and `intervals`, thinking off rescued as many attempts as the other settings
+  (2, 1 and 0 rescues for off, default and capped). Those counts are tiny: no evidence that
+  thinking helps, not proof that it does not.
+- Thinking off's missing pass is one attempt lost to an Ollama abort ("token repeat limit
+  reached") before escalation was even reached; the control lost one the same way. Such aborts
+  are now retried once.
+- Only 10 attempts per variant can tell them apart (`csvrow` is 0 for all), so one flipped
+  attempt is 10 points. Read this as "about three times faster at no visible cost", not as a
+  ranking of the settings.
+- The control ran after the reasoning-stripping fix, so it is not the setup of the earlier
+  baseline: compare variants with each other, not with the baseline.
+
+Reports are in `runs/evals/` (`control`, `think-off`, `think-capped`) and the patches in
+`experiments/`. `experiments/think-default.yaml` re-creates the old control now that thinking is
+off in `config.yaml`.
 
 `_smoke_test.py` is also pytest-ready (`def test_*()` functions), so `pytest`
 will collect it in CI.
@@ -101,8 +145,10 @@ requirements: ['six==1.17.0']       # optional; installed at image build time on
   replies with whole files (` ```path/to/file.py ` blocks), which are applied only if the
   path is relative and inside the project (no `..`, drive letters, symlinks or `.git`).
   A bad path fails the lap; nothing from that reply is tested.
-- Tests run with `pytest` in the Docker sandbox: workspace mounted read-only, no network.
-  Packages in `requirements:` are installed while the image is built, never at test time.
+- Tests run with `pytest` (`python -I -m pytest`, pinned in the image) in the Docker sandbox:
+  workspace mounted read-only, no network. Packages in `requirements:` are installed while the
+  image is built, never at test time. Only `pytest` commands get the `-I` treatment; another
+  `test_command` still runs, but without that protection.
 - **The worker cannot edit the tests.** `test_*.py`, `tests/`, `conftest.py`, `pytest.ini`,
   `pyproject.toml` and similar are protected: edits to them are ignored (the rest of the
   reply still counts) and checked again by content before every test run. Add globs with
@@ -131,7 +177,8 @@ harness checks first).
   first node boundary after its total passes that number.
 - **Experiments are small patches.** `AGENT_LOOP_CONFIG` names a YAML file layered over
   `config.yaml` (models and `model_options` merge key by key), so it holds only the difference.
-  `experiments/` has `control`, `think-off` and `think-capped`. In PowerShell:
+  `experiments/` has `control` (the current `config.yaml`), `think-default` (the escalation
+  model's own thinking), `think-off` and `think-capped`. In PowerShell:
   `$env:AGENT_LOOP_CONFIG = "experiments\think-off.yaml"`. A patch cannot turn the sandbox off or
   use an unknown option. Per-role `model_options` allow `reasoning`, `num_predict` and
   `temperature` only; a thinking model's reasoning is stripped from its answer before use.
@@ -263,6 +310,13 @@ Model-written code is the threat. These layers apply on every run:
    paths, so they allow only letters, digits, `.`, `_` and `-`.
 7. **Bounded.** A rejection cap, one escalation per cap, test timeouts, and
    `--budget` tokens per eval attempt.
+8. **Project code cannot replace pytest.** The test image pins pytest, puts the project on
+   `sys.path` after the standard library (`work.pth`), occupies the `sitecustomize` name, and
+   runs `python -I -m pytest`, so a worker-written `pytest.py` or `sitecustomize.py` cannot load
+   first and force a pass. Those names, `_pytest/` and `*.pth` are also protected. A test plants
+   exactly those files in a real container, checks the verdict is still the real one, and checks
+   the same files DO fool the old command, so the test can fail. The image tag includes the
+   Dockerfile, so editing it rebuilds the image instead of reusing a stale one.
 
 What this does not give you: a container shares a kernel with its host (Docker
 Desktop's WSL2 VM, here), so an escape is unlikely but not impossible. The image

@@ -16,7 +16,10 @@ TEXT_SUFFIXES = {".py", ".md", ".txt", ".toml", ".cfg", ".ini", ".yaml", ".yml",
 # The tests are the grade, so the worker may not edit them or the files that steer
 # test collection. fnmatch's `*` crosses `/`, so `tests/*` covers nested paths.
 DEFAULT_PROTECTED = ("test_*.py", "*_test.py", "conftest.py", "tests/*", "*/tests/*",
-                     "test/*", "*/test/*", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml")
+                     "test/*", "*/test/*", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+                     # names that would replace pytest or run at interpreter start-up if they got
+                     # onto the path (the sandbox also keeps the project off the front of it)
+                     "pytest.py", "_pytest/*", "sitecustomize.py", "usercustomize.py", "*.pth")
 MAX_BLOCKS = 20             # files the worker may write per lap
 MAX_FILE_BYTES = 100_000    # one written file
 

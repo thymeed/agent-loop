@@ -1,1 +1,2 @@
-# Control: no changes. The run uses config.yaml exactly as it is.
+# Control: no changes. The run uses config.yaml exactly as it is (today: escalation thinking OFF).
+# For the model's default thinking, use think-default.yaml.

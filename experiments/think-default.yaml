@@ -1,0 +1,5 @@
+# The escalation model's own default: thinking left to the model (on for qwen3). This is how the
+# 2026-10-29 "control" run was configured, before thinking was switched off in config.yaml.
+model_options:
+  escalation:
+    reasoning: null

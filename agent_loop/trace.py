@@ -48,9 +48,13 @@ RETRY_WAIT = 5.0  # seconds before the one retry of a transient server error
 
 
 def _transient(exc: Exception) -> bool:
-    """A server-side failure (5xx) such as Ollama's occasional CUDA error: worth one more try."""
+    """A failure worth one more try: a server-side error (5xx) such as Ollama's occasional CUDA
+    crash, or Ollama aborting a generation that got stuck repeating tokens (status -1; sampling is
+    random, so a second try usually comes out differently)."""
     status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and not isinstance(status, bool) and status in (500, 502, 503, 504)
+    if not isinstance(status, int) or isinstance(status, bool):
+        return False
+    return status in (500, 502, 503, 504) or (status == -1 and "repeat limit" in str(exc).lower())
 
 
 def llm_call(role: str, model, prompt: str):

@@ -8,6 +8,14 @@ models:
   # Delete the line to turn escalation off.
   escalation: ollama:qwen3:8b
 
+# Per-role model options (only reasoning, num_predict and temperature are accepted).
+# Escalation runs with thinking OFF: in the 2026-10-29 experiment (README, "Escalation findings")
+# that made attempts about three times faster and rescued no fewer of them. `reasoning: null`
+# restores the model's own default (thinking on; its reasoning is stripped from the answer).
+model_options:
+  escalation:
+    reasoning: false
+
 max_rejections: 3
 test_timeout: 15
 

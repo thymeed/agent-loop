@@ -39,7 +39,10 @@ def validate_requirements(requirements: list[str]) -> list[str]:
 
 
 def image_tag(requirements: list[str]) -> str:
-    key = "\n".join([CONFIG["sandbox_image"], *sorted(requirements)])
+    """Names the image by what is in it: the base, the Dockerfile and the requirements, so editing
+    the Dockerfile builds a fresh image instead of silently reusing a stale one."""
+    recipe = hashlib.sha256(DOCKERFILE.read_bytes().replace(b"\r\n", b"\n")).hexdigest()  # CRLF == LF
+    key = "\n".join([CONFIG["sandbox_image"], recipe, *sorted(requirements)])
     return "agent-loop-proj-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
@@ -70,7 +73,10 @@ def _test_argv(command: str) -> list[str]:
     if not argv:
         raise ValueError("test_command is empty")
     if argv[0] == "pytest":
-        argv[1:1] = ["-p", "no:cacheprovider"]  # /work is read-only; no .pytest_cache
+        # -I: ignore PYTHONPATH and keep the working directory off sys.path, so nothing in the project
+        # can shadow pytest or run at interpreter start-up (the image's work.pth adds the project
+        # AFTER the standard library). -B: /work is read-only, write no bytecode.
+        return ["python", "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider", *argv[1:]]
     return argv
 
 
@@ -85,7 +91,9 @@ def project_docker_cmd(name: str, workspace: Path, image: str, command: str) -> 
                                pids=256, tmp_mb=64),
         "--mount", f"type=bind,source={source},target=/work,readonly",
         "-w", "/work",
-        "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "PYTHONPATH=/work:/work/src", "-e", "HOME=/tmp",
+        # No PYTHONPATH: it would put project files ahead of site-packages. The image's work.pth
+        # makes /work and /work/src importable after them instead.
+        "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "HOME=/tmp",
         image, *_test_argv(command),
     ]
 

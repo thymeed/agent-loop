@@ -35,7 +35,7 @@ DEFAULT_CONFIG_PATH = CONFIG_PATH
 # experiment must not silently change what is being measured, and an option a model rejects
 # (reasoning on a model that cannot think) must be opt-in per role.
 MODEL_OPTION_RULES = {
-    "reasoning": (lambda v: isinstance(v, bool), "true or false"),
+    "reasoning": (lambda v: v is None or isinstance(v, bool), "true, false or null (the model's own default)"),
     "num_predict": (lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 32768,
                     "a whole number from 1 to 32768"),
     "temperature": (lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 2,

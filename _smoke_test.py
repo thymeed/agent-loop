@@ -565,8 +565,7 @@ def test_project_docker_command_is_locked_down_with_a_readonly_mount():
     for flag in ("--network none", "--read-only", "--cap-drop ALL", "no-new-privileges",
                  "--pids-limit", "--memory", "--user 65534", "target=/work,readonly", "-w /work"):
         assert flag in joined, (flag, joined)
-    assert cmd[-6:] == ["pytest", "-p", "no:cacheprovider", "-q", "tests"][-6:] or \
-        cmd[cmd.index("img") + 1:] == ["pytest", "-p", "no:cacheprovider", "-q", "tests"], cmd
+    assert cmd[cmd.index("img") + 1:] == ["python", "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests"], cmd
     assert cmd.count("--mount") == 1 and "-v" not in cmd and "--volume" not in cmd
     assert "/var/run/docker.sock" not in joined
     try:
@@ -2147,6 +2146,110 @@ def test_a_transient_server_error_is_retried_exactly_once():
         assert "llm_retry" not in [e["event"] for e in _events(path.parent.parent, "t")]
 
 
+def test_the_project_is_kept_off_the_front_of_the_python_path():
+    import pathlib, re, tempfile
+    ws = pathlib.Path(tempfile.mkdtemp())
+    cmd = sandbox.project_docker_cmd("n", ws, "img", "pytest -q tests")
+    assert cmd[cmd.index("img") + 1:] == ["python", "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests"], cmd
+    assert not any("PYTHONPATH" in part for part in cmd), "PYTHONPATH would put project files ahead of site-packages"
+    assert sandbox._test_argv("python -m unittest")[:3] == ["python", "-m", "unittest"], "only pytest commands are rewritten"
+    docker = pathlib.Path(sandbox.DOCKERFILE).read_text(encoding="utf-8")
+    assert re.search(r"install --no-cache-dir pytest==\d+\.\d+\.\d+", docker), "pytest must be pinned"
+    assert "work.pth" in docker and "/work/src" in docker, "the project goes on the path through the image"
+    assert "sitecustomize.py" in docker, "the image must occupy the sitecustomize name"
+
+
+def test_the_image_tag_follows_the_dockerfile():
+    import pathlib, tempfile
+    recipe = pathlib.Path(tempfile.mkdtemp()) / "Dockerfile"
+    text = pathlib.Path(sandbox.DOCKERFILE).read_text(encoding="utf-8").replace("\r\n", "\n")
+    recipe.write_bytes(text.encode("utf-8"))
+    with mock.patch.object(sandbox, "DOCKERFILE", recipe):
+        tag = sandbox.image_tag(["six==1.17.0"])
+        assert sandbox.image_tag(["six==1.17.0"]) == tag and tag.startswith("agent-loop-proj-")
+        recipe.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+        assert sandbox.image_tag(["six==1.17.0"]) == tag, "a Windows checkout (CRLF) must name the same image"
+        recipe.write_bytes((text + "# an edit" + NL).encode("utf-8"))
+        edited = sandbox.image_tag(["six==1.17.0"])
+        assert edited != tag, "editing the Dockerfile must build a new image, not reuse the stale one"
+        assert sandbox.image_tag(["six==1.16.0"]) != edited, "the requirements still matter"
+
+
+def test_names_that_could_replace_pytest_or_run_at_startup_are_protected():
+    import pathlib, tempfile
+    p = workspace.DEFAULT_PROTECTED
+    for name in ["pytest.py", "pkg/pytest.py", "_pytest/__init__.py", "_pytest/python.py", "sitecustomize.py",
+                 "usercustomize.py", "SiteCustomize.py", "evil.pth", "pkg/x.pth"]:
+        assert workspace.is_protected(name, p), name
+    for free in ["mypytest.py", "pytesting.py", "sitecustomize_helpers.py", "my_pytest/util.py", "pth.py", "src/app.py"]:
+        assert not workspace.is_protected(free, p), free
+    ws = _project(pathlib.Path(tempfile.mkdtemp()) / "ws", {"app.py": "x = 0" + NL})
+    reply = NL.join(FENCE + name + NL + "import os" + NL + FENCE for name in
+                    ["sitecustomize.py", "pytest.py", "_pytest/hook.py", "evil.pth", "app.py"])
+    result = workspace.apply_blocks(ws, reply)
+    assert result.written == ["app.py"] and len(result.skipped) == 4 and not result.errors, result
+    assert not (ws / "sitecustomize.py").exists() and not (ws / "pytest.py").exists()
+
+
+def test_a_repeat_limit_abort_is_retried_once_but_other_unknown_errors_are_not():
+    from agent_loop import trace
+    abort = "prediction aborted, token repeat limit reached"
+    assert trace._transient(_ServerError(abort, -1))
+    assert not trace._transient(_ServerError("some other failure", -1))
+    assert not trace._transient(_ServerError(abort, 400)), "only the -1 abort counts"
+    assert not trace._transient(_ServerError(abort, None)) and not trace._transient(ValueError(abort))
+    model = _FlakyLLM([_ServerError(abort, -1)])
+    with mock.patch.object(trace, "RETRY_WAIT", 0):
+        resp = trace.llm_call("worker", model, "prompt")
+    assert resp.content == "fine" and model.calls == 2
+    model = _FlakyLLM([_ServerError(abort, -1), _ServerError(abort, -1)])
+    with mock.patch.object(trace, "RETRY_WAIT", 0):
+        try:
+            trace.llm_call("worker", model, "prompt")
+        except _ServerError:
+            pass
+        else:
+            raise AssertionError("a second abort must propagate")
+    assert model.calls == 2
+
+
+def test_real_docker_planted_startup_code_cannot_fake_a_pass_but_the_old_command_could():
+    """The attack: files in the project that load before pytest and force a green result."""
+    import pathlib, tempfile
+    if not _docker_up():
+        print("  (docker not available - skipped)")
+        return
+    root = pathlib.Path(tempfile.mkdtemp())
+    files = {
+        "calc.py": "def add(a, b):" + NL + "    return a - b" + NL,
+        "test_calc.py": "from calc import add" + NL + "def test_add():" + NL + "    assert add(2, 3) == 5" + NL,
+        "src/mylib/__init__.py": "VALUE = 7" + NL,
+        "test_lib.py": "from mylib import VALUE" + NL + "def test_value():" + NL + "    assert VALUE == 7" + NL,
+        # planted: any of these, if loaded ahead of the real ones, makes the run exit 0
+        "sitecustomize.py": "import atexit, os" + NL + "atexit.register(lambda: os._exit(0))" + NL,
+        "pytest.py": "raise SystemExit(0)" + NL,
+        "_pytest/__init__.py": "raise SystemExit(0)" + NL,
+    }
+    ws = _project(root / "ws", files)
+    with _docker_mode():
+        ok, out = sandbox.run_project_tests(ws, "pytest -q", [])
+        assert not ok and "1 failed" in out and "1 passed" in out, out      # the real verdict, src-layout import works
+        honest = _project(root / "honest", {**files, "calc.py": "def add(a, b):" + NL + "    return a + b" + NL})
+        ok, out = sandbox.run_project_tests(honest, "pytest -q", [])
+        assert ok and "2 passed" in out, out                                 # the planted files do not break a good run
+
+        # the same planted files DO fool the old command (project first on PYTHONPATH, bare `pytest`)
+        image = sandbox.ensure_image([])
+        new = sandbox.project_docker_cmd("planted-old", ws, image, "pytest -q")
+        i = new.index(image)
+        old = new[:i] + ["-e", "PYTHONPATH=/work:/work/src", image, "pytest", "-p", "no:cacheprovider", "-q"]
+        fooled = subprocess.run(old, capture_output=True, encoding="utf-8", errors="replace", timeout=120)
+        assert fooled.returncode == 0, "the attack must work against the old command, or this test proves nothing"
+    left = subprocess.run(["docker", "ps", "-a", "--filter", "name=agent-loop-", "--format", "{{.Names}}"],
+                          capture_output=True, text=True).stdout.split()
+    assert not left, left
+
+
 def test_eval_fixtures_match_their_pin():
     from agent_loop import fixtures
     assert fixtures.pinned() is not None, "evals/FIXTURES.sha256 is missing"
@@ -2203,10 +2306,13 @@ def test_model_options_are_whitelisted_and_type_checked():
                                  "    reasoning: false" + NL + "    num_predict: 4096" + NL + "    temperature: 0.2" + NL), env={})
     assert ok["model_options"] == {"escalation": {"reasoning": False, "num_predict": 4096, "temperature": 0.2}}
     assert config.load_config(_cfg(tmp, "none.yaml", base), env={})["model_options"] == {}
+    default = config.load_config(_cfg(tmp, "null.yaml", base + "model_options:" + NL + "  escalation:" + NL +
+                                      "    reasoning: null" + NL), env={})
+    assert default["model_options"] == {"escalation": {"reasoning": None}}, "null means the model's own default"
 
     for bad in (
         "    think: false",                      # not an allowed option (typo for reasoning)
-        "    reasoning: 'yes'", "    reasoning: 1", "    reasoning: null",
+        "    reasoning: 'yes'", "    reasoning: 1", "    reasoning: 0", "    reasoning: low",
         "    num_predict: 0", "    num_predict: 99999", "    num_predict: true", "    num_predict: '5'", "    num_predict: 1.5",
         "    temperature: -1", "    temperature: 3", "    temperature: hot",
         "    base_url: http://evil.example", "    num_ctx: 99999999", "    keep_alive: -1", "    seed: 1",
@@ -2289,13 +2395,16 @@ def test_the_shipped_experiment_files_change_only_what_they_say():
     base = config.load_config(config.CONFIG_PATH, env={})
     results = {p.stem: config.load_config(config.CONFIG_PATH, env={"AGENT_LOOP_CONFIG": str(p)})
                for p in sorted(experiments.glob("*.yaml"))}
-    assert sorted(results) == ["control", "think-capped", "think-off"], sorted(results)
+    assert sorted(results) == ["control", "think-capped", "think-default", "think-off"], sorted(results)
+    # the adopted setting: the experiment found thinking off as good and about three times faster
+    assert base["model_options"] == {"escalation": {"reasoning": False}}, base["model_options"]
     for name, cfg in results.items():
         assert cfg["models"] == base["models"], f"{name} must not change models"
         assert {k: v for k, v in cfg.items() if k not in ("model_options", "override")} == \
             {k: v for k, v in base.items() if k not in ("model_options", "override")}, f"{name} changes more than model options"
     assert results["control"]["model_options"] == base["model_options"]
     assert results["think-off"]["model_options"]["escalation"] == {"reasoning": False}
+    assert results["think-default"]["model_options"]["escalation"] == {"reasoning": None}, "re-creates the old control"
     assert results["think-capped"]["model_options"]["escalation"] == {"reasoning": True, "num_predict": 4096}
     assert all(set(cfg["model_options"]) <= {"escalation"} for cfg in results.values()), "only the escalation role is touched"
 
