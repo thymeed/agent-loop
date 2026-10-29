@@ -6,8 +6,8 @@ import yaml
 DEFAULTS = {
     "models": {
         "lead": "ollama:gemma3:4b",
-        "worker": "ollama:gemma3:4b",
-        "reviewer": "ollama:gemma3:4b",
+        "worker": "ollama:qwen2.5-coder:7b",
+        "reviewer": "ollama:qwen2.5-coder:7b",
     },
     "max_rejections": 3,
     "test_timeout": 15,

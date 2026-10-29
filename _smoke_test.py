@@ -9,7 +9,7 @@ from unittest import mock
 
 from langgraph.types import Command
 
-from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes, research
+from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes, research, workspace
 from agent_loop.tasks import Task, load_task
 
 NL = chr(10)
@@ -372,6 +372,138 @@ def test_no_escalation_without_a_configured_model():
     worker, _ = install(code=BROKEN)
     nodes, _ = drive("no-esc", resume="stop", tests=checks.TESTS)
     assert "escalate" not in nodes, nodes
+
+
+def _project(tmp, files):
+    for name, text in files.items():
+        f = tmp / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(text.encode("utf-8"))
+    return tmp
+
+
+def test_copy_project_skips_junk_and_refuses_symlinks_and_size():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    src = _project(root / "src", {"a.py": "x = 1\n", "pkg/b.py": "y = 2\n",
+                                  ".git/config": "secret", "__pycache__/a.pyc": "junk",
+                                  ".venv/lib.py": "junk"})
+    dest = root / "ws"
+    workspace.copy_project(src, dest, max_bytes=10_000)
+    assert workspace.project_files(dest) == ["a.py", "pkg/b.py"], workspace.project_files(dest)
+    assert not (dest / ".git").exists() and not (dest / ".venv").exists()
+    for bad, kwargs in [(dest, {"max_bytes": 10_000}), (root / "big", {"max_bytes": 3})]:
+        try:
+            workspace.copy_project(src, bad, **kwargs)
+        except workspace.WorkspaceError:
+            continue
+        raise AssertionError("expected WorkspaceError")
+
+
+def test_apply_blocks_writes_files_and_rejects_hostile_paths():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    ws = _project(root / "ws", {"keep.py": "old\n", "sub/x.py": "x\n"})
+    outside = root / "evil.py"
+    fence = "`" * 3
+    reply = NL.join([
+        "Here you go.",
+        fence + "pkg/new.py", "print('hi')", fence,
+        fence + "keep.py", "new content", fence,
+        fence + "../evil.py", "owned", fence,
+        fence + "/etc/passwd", "owned", fence,
+        fence + "C:/Windows/evil.py", "owned", fence,
+        fence + "back" + chr(92) + "slash.py", "owned", fence,
+        fence + ".git/hooks/pre-commit", "owned", fence,
+        fence + "python", "print('a bare language fence is not a file')", fence,
+    ])
+    result = workspace.apply_blocks(ws, reply)
+    assert result.written == ["pkg/new.py", "keep.py"], result
+    assert len(result.errors) == 5, result.errors
+    assert (ws / "keep.py").read_bytes() == b"new content\n"
+    assert b"\r" not in (ws / "pkg" / "new.py").read_bytes(), "must not write CRLF"
+    assert not outside.exists() and not (ws / ".git").exists()
+
+    empty = workspace.apply_blocks(ws, "I refuse to write any blocks")
+    assert not empty.written and "no file blocks" in empty.errors[0], empty
+
+    too_many = NL.join(fence + f"f{i}.py" + NL + "x" + NL + fence for i in range(workspace.MAX_BLOCKS + 1))
+    assert not workspace.apply_blocks(ws, too_many).written
+
+
+def test_apply_blocks_rejects_symlink_escape():
+    import os, pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    ws = _project(root / "ws", {"a.py": "x\n"})
+    outside = root / "outside"
+    outside.mkdir()
+    try:
+        os.symlink(outside, ws / "link", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        print("  (symlinks not permitted here - skipped)")
+        return
+    fence = "`" * 3
+    result = workspace.apply_blocks(ws, fence + "link/pwn.py" + NL + "owned" + NL + fence)
+    assert not result.written and result.errors, result
+    assert not (outside / "pwn.py").exists()
+
+
+def test_context_and_patch():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    orig = _project(root / "orig", {"app.py": "def f():\n    return 1\n", "test_app.py": "from app import f\n",
+                                    "notes.bin": "binary-ish"})
+    ws = root / "ws"
+    workspace.copy_project(orig, ws, max_bytes=10_000)
+    ctx = workspace.build_context(ws, budget=10_000)
+    assert "### app.py" in ctx and "### test_app.py" in ctx and "notes.bin" not in ctx, ctx
+    assert ctx.index("### test_app.py") < ctx.index("### app.py"), "tests come first"
+    small = workspace.build_context(ws, budget=40)
+    assert "not shown" in small, small
+
+    fence = "`" * 3
+    workspace.apply_blocks(ws, NL.join([fence + "app.py", "def f():", "    return 2", fence,
+                                       fence + "new.py", "z = 1", fence]))
+    patch = workspace.make_patch(orig, ws)
+    assert "diff --git a/app.py b/app.py" in patch and "-    return 1" in patch and "+    return 2" in patch, patch
+    assert "new file mode 100644" in patch and "+++ b/new.py" in patch, patch
+    assert "test_app.py" not in patch
+    # the patch is real git-apply input, and applies cleanly to the original
+    import shutil, subprocess
+    if shutil.which("git"):
+        (root / "p.patch").write_bytes(patch.encode("utf-8"))
+        check = subprocess.run(["git", "apply", "--check", str(root / "p.patch")], cwd=orig,
+                               capture_output=True, text=True)
+        assert check.returncode == 0, check.stderr
+
+
+def test_no_personal_data_in_repo_files():
+    """Privacy gate: no home-directory paths, emails or key-shaped strings in committed files."""
+    import re, shutil, pathlib
+    if not shutil.which("git"):
+        return
+    BS = chr(92)
+    repo = pathlib.Path(__file__).resolve().parent
+    files = (subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+                            cwd=repo, capture_output=True, text=True).stdout.split(NL))
+    patterns = {
+        "home directory path": re.compile(
+            "[A-Za-z]:" + BS * 2 + "Users" + BS * 2 + "|/Users/[A-Za-z]|/home/[a-z]"),
+        "email address": re.compile(r"[\w.+-]+@(?!users\.noreply\.github\.com)[\w-]+\.[a-z]{2,}"),
+        "key-shaped string": re.compile(r"sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}"),
+    }
+    hits = []
+    for name in filter(None, files):
+        path = repo / name
+        if not path.is_file() or path.suffix in {".pyc", ".sqlite"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for label, rx in patterns.items():
+            if name == "_smoke_test.py":
+                continue  # this file contains the patterns themselves
+            for m in rx.finditer(text):
+                hits.append(f"{name}: {label}: {m.group(0)!r}")
+    assert not hits, hits
 
 
 def _docker_mode():

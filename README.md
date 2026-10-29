@@ -1,7 +1,8 @@
 # agent-loop
 
 Lead → worker → check → reviewer loop with a 3-rejection cap, built on LangGraph
-and a local Ollama model (`gemma3:4b`).
+and local Ollama models: `gemma3:4b` plans, `qwen2.5-coder:7b` writes and reviews
+(set per role in `config.yaml`).
 
 - `lead` writes a short plan.
 - `worker` writes a solution (code in a fenced block).
@@ -14,6 +15,15 @@ and a local Ollama model (`gemma3:4b`).
   `stop` or `accept` (case and trailing punctuation ignored) ends the run and
   records an `outcome`; anything longer is guidance, resets the counter, and
   sends it back for another lap.
+
+## Install
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Needs Ollama (with the models above pulled) and Docker running.
 
 ## Run
 
@@ -48,10 +58,11 @@ process (it asks the owner call again if it was paused at one):
 ## Escalation
 
 When a task hits the rejection cap, the model under `escalation:` in `config.yaml`
-(`ollama:qwen2.5-coder:7b`) gets one attempt, with the same prompt and the same
+gets one attempt, with the same prompt and the same
 `check`, before the owner is asked. Its tokens show on their own `escalate` row. An
 owner reply that is guidance resets the cap and earns another escalation. Delete the
-`escalation:` line to turn it off.
+`escalation:` line to turn it off. It ships commented out: pull a model that differs
+from the worker (`ollama pull qwen3:8b`) and uncomment it.
 
 `_smoke_test.py` is also pytest-ready (`def test_*()` functions), so `pytest`
 will collect it in CI.

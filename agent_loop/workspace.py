@@ -1,0 +1,175 @@
+"""Project workspaces: copy a project, show it to the worker, apply its file blocks safely.
+
+Everything here is pure file handling with no model calls. `apply_blocks` is the
+security boundary for paths written by a model.
+"""
+import difflib
+import re
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+
+SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+             ".mypy_cache", ".ruff_cache", ".tox", "runs"}
+TEXT_SUFFIXES = {".py", ".md", ".txt", ".toml", ".cfg", ".ini", ".yaml", ".yml", ".json", ".rst"}
+MAX_BLOCKS = 20             # files the worker may write per lap
+MAX_FILE_BYTES = 100_000    # one written file
+
+# ```path/to/file.py  (fence info string is the path)  ...content...  ```
+_BLOCK = re.compile(r"^```[ \t]*(?P<path>[^\s`]+)[ \t]*\r?\n(?P<body>.*?)^```[ \t]*$",
+                    re.DOTALL | re.MULTILINE)
+# Info strings that are a language, not a path: they carry no file name.
+_LANGUAGES = {"python", "py", "text", "txt", "bash", "sh", "shell", "diff", "yaml", "json",
+              "toml", "markdown", "md", "console", "output"}
+
+
+class WorkspaceError(ValueError):
+    """The project cannot be used as a workspace."""
+
+
+def copy_project(src: Path, dest: Path, *, max_bytes: int) -> None:
+    """Copy `src` to a fresh `dest`, skipping junk dirs; refuse symlinks and huge projects."""
+    src = Path(src)
+    if not src.is_dir():
+        raise WorkspaceError(f"project directory not found: {src}")
+    if dest.exists():
+        raise WorkspaceError(f"workspace already exists: {dest}")
+    total = 0
+    files: list[Path] = []
+    for path in sorted(src.rglob("*")):
+        rel = path.relative_to(src)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        if path.is_symlink():
+            raise WorkspaceError(f"symlinks are not allowed in a project: {rel}")
+        if path.is_file():
+            total += path.stat().st_size
+            if total > max_bytes:
+                raise WorkspaceError(f"project is over the {max_bytes}-byte limit")
+            files.append(rel)
+    for rel in files:
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src / rel, target)
+    dest.mkdir(parents=True, exist_ok=True)  # an empty project still gets a workspace
+
+
+def project_files(root: Path) -> list[str]:
+    """Text files of the workspace as posix paths, sorted."""
+    return sorted(
+        p.relative_to(root).as_posix() for p in Path(root).rglob("*")
+        if p.is_file() and not p.is_symlink() and p.suffix in TEXT_SUFFIXES
+        and not any(part in SKIP_DIRS for part in p.relative_to(root).parts)
+    )
+
+
+def build_context(root: Path, *, budget: int, first: tuple[str, ...] = ()) -> str:
+    """File tree plus file contents that fit `budget` characters; tests first, then `first`."""
+    names = project_files(root)
+    names.sort(key=lambda n: (not Path(n).name.startswith("test_") and not n.startswith("tests/"),
+                              n not in first, n))
+    parts, used, omitted = [], 0, []
+    for name in names:
+        text = (Path(root) / name).read_text(encoding="utf-8", errors="replace")
+        block = f"### {name}\n```\n{text}\n```\n"
+        if used + len(block) > budget:
+            omitted.append(name)
+            continue
+        parts.append(block)
+        used += len(block)
+    out = "Project files:\n" + "\n".join(f"- {n}" for n in names) + "\n\n" + "\n".join(parts)
+    if omitted:
+        out += "\n(not shown, over the context budget: " + ", ".join(omitted) + ")\n"
+    return out
+
+
+@dataclass
+class Applied:
+    written: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+def parse_blocks(reply: str) -> list[tuple[str, str]]:
+    """(path, content) for each fenced block whose info string is a file path."""
+    blocks = []
+    for m in _BLOCK.finditer(reply or ""):
+        path = m["path"].strip()
+        if path.lower() in _LANGUAGES:
+            continue
+        blocks.append((path, m["body"]))
+    return blocks
+
+
+def _check_path(root: Path, raw: str) -> tuple[Path | None, str | None]:
+    """The resolved target inside `root`, or an error string."""
+    if "\\" in raw or ":" in raw:
+        return None, f"{raw}: use plain relative posix paths (no backslashes or drive letters)"
+    posix = PurePosixPath(raw)
+    if posix.is_absolute() or ".." in posix.parts:
+        return None, f"{raw}: path must be relative and stay inside the project"
+    if any(part in SKIP_DIRS for part in posix.parts):
+        return None, f"{raw}: writing into {sorted(set(posix.parts) & SKIP_DIRS)[0]} is not allowed"
+    root_real = Path(root).resolve()
+    target = (root_real / posix).resolve()
+    if root_real != target and root_real not in target.parents:
+        return None, f"{raw}: resolves outside the project"
+    # A symlink anywhere on the path could point out of the workspace.
+    probe = root_real
+    for part in posix.parts:
+        probe = probe / part
+        if probe.is_symlink():
+            return None, f"{raw}: path goes through a symlink"
+    return target, None
+
+
+def apply_blocks(root: Path, reply: str) -> Applied:
+    """Write the reply's file blocks into `root`. Bad blocks are reported, never written."""
+    result = Applied()
+    blocks = parse_blocks(reply)
+    if not blocks:
+        result.errors.append("no file blocks found; reply with one ```path/to/file.py block "
+                             "per changed file, containing the complete new file")
+        return result
+    if len(blocks) > MAX_BLOCKS:
+        result.errors.append(f"{len(blocks)} files in one reply; the limit is {MAX_BLOCKS}")
+        return result
+    for raw, content in blocks:
+        target, error = _check_path(root, raw)
+        if error is None and len(content.encode("utf-8")) > MAX_FILE_BYTES:
+            error = f"{raw}: file is over {MAX_FILE_BYTES} bytes"
+        if error is None and target.is_dir():
+            error = f"{raw}: is a directory"
+        if error:
+            result.errors.append(error)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # bytes, not write_text: Windows would turn every LF into CRLF and pollute the diff
+        target.write_bytes((content if content.endswith("\n") else content + "\n").encode("utf-8"))
+        result.written.append(PurePosixPath(raw).as_posix())
+    return result
+
+
+def _lines(path: Path) -> list[str]:
+    """Lines with their original endings (CRLF files must diff and apply as CRLF)."""
+    if not path.exists():
+        return []
+    return path.read_bytes().decode("utf-8", errors="replace").splitlines(keepends=True)
+
+
+def make_patch(original: Path, workspace: Path) -> str:
+    """Unified diff (git-apply style, a/ and b/ prefixes) from `original` to `workspace`."""
+    names = set(project_files(original)) | set(project_files(workspace))
+    chunks = []
+    for name in sorted(names):
+        old, new = Path(original) / name, Path(workspace) / name
+        old_lines, new_lines = _lines(old), _lines(new)
+        if old_lines == new_lines:
+            continue
+        header = ["--- /dev/null\n" if not old.exists() else f"--- a/{name}\n",
+                  "+++ /dev/null\n" if not new.exists() else f"+++ b/{name}\n"]
+        diff = list(difflib.unified_diff(old_lines, new_lines, n=3))[2:]
+        if diff and not diff[-1].endswith("\n"):
+            diff[-1] += "\n\\ No newline at end of file\n"
+        mode = "new file mode 100644\n" if not old.exists() else ""
+        chunks.append(f"diff --git a/{name} b/{name}\n{mode}" + "".join(header + diff))
+    return "".join(chunks)
