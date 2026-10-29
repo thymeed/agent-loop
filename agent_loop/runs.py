@@ -8,6 +8,14 @@ RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
 DB_PATH = RUNS_DIR / "checkpoints.sqlite"
 
 
+_THREAD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+
+
+def valid_thread(name: str) -> bool:
+    """Thread ids become folder names and docker mount paths, so keep them plain."""
+    return bool(_THREAD.fullmatch(name)) and ".." not in name
+
+
 def new_thread_id(label: str) -> str:
     """Unique per run, so a shared checkpoint DB never mixes two runs in one thread."""
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-")[:40] or "run"

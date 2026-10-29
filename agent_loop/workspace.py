@@ -32,8 +32,22 @@ class WorkspaceError(ValueError):
     """The project cannot be used as a workspace."""
 
 
-def copy_project(src: Path, dest: Path, *, max_bytes: int) -> None:
-    """Copy `src` to a fresh `dest`, skipping junk dirs; refuse symlinks and huge projects."""
+# Files that look like credentials are never copied into a workspace: the workspace is
+# mounted into a container that runs model-written code.
+SECRET_NAMES = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx", "id_rsa*", "id_dsa*",
+                "id_ecdsa*", "id_ed25519*", ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+                "credentials", "credentials.*", "secrets.*", "*.token")
+# Key-shaped strings inside ordinary files. A hit refuses the project instead of copying it.
+SECRET_CONTENT = re.compile(r"sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}"
+                            r"|-----BEGIN [A-Z ]*PRIVATE KEY-----")
+MAX_SCAN_BYTES = 1_000_000
+
+
+def copy_project(src: Path, dest: Path, *, max_bytes: int) -> list[str]:
+    """Copy `src` to a fresh `dest`, skipping junk dirs; refuse symlinks and huge projects.
+
+    Credential-looking files are skipped (their names are returned); a file that contains
+    a key-shaped string makes the whole copy fail, naming the file but never the secret."""
     src = Path(src)
     if not src.is_dir():
         raise WorkspaceError(f"project directory not found: {src}")
@@ -41,6 +55,7 @@ def copy_project(src: Path, dest: Path, *, max_bytes: int) -> None:
         raise WorkspaceError(f"workspace already exists: {dest}")
     total = 0
     files: list[Path] = []
+    skipped: list[str] = []
     for path in sorted(src.rglob("*")):
         rel = path.relative_to(src)
         if any(part in SKIP_DIRS for part in rel.parts):
@@ -48,15 +63,25 @@ def copy_project(src: Path, dest: Path, *, max_bytes: int) -> None:
         if path.is_symlink():
             raise WorkspaceError(f"symlinks are not allowed in a project: {rel}")
         if path.is_file():
-            total += path.stat().st_size
+            if any(fnmatch.fnmatchcase(path.name.lower(), pat) for pat in SECRET_NAMES):
+                skipped.append(rel.as_posix())
+                continue
+            size = path.stat().st_size
+            total += size
             if total > max_bytes:
                 raise WorkspaceError(f"project is over the {max_bytes}-byte limit")
+            if path.suffix in TEXT_SUFFIXES and size <= MAX_SCAN_BYTES:
+                if SECRET_CONTENT.search(path.read_text(encoding="utf-8", errors="ignore")):
+                    raise WorkspaceError(
+                        f"{rel.as_posix()} contains what looks like a secret (API key or private key); "
+                        "remove it from the project before using it with this tool")
             files.append(rel)
     for rel in files:
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src / rel, target)
     dest.mkdir(parents=True, exist_ok=True)  # an empty project still gets a workspace
+    return sorted(skipped)
 
 
 def project_files(root: Path) -> list[str]:

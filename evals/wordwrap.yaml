@@ -1,0 +1,7 @@
+type: project
+task: >-
+  Implement wrapper.wrap(text, width): greedy word wrap that returns a list of lines.
+  Words are separated by any whitespace and joined with a single space. A line holds as
+  many words as fit within width characters. A word longer than width goes on its own
+  line, unbroken. Empty or blank text gives an empty list. Do not change the tests.
+project: projects/wordwrap

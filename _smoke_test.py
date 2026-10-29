@@ -3,13 +3,15 @@
 Run with pytest (`python -m pytest _smoke_test.py -q`) or directly
 (`python _smoke_test.py`).
 """
+import contextlib
 import subprocess
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
 from langgraph.types import Command
 
-from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes, research, sandbox, workspace
+from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes, evals, research, sandbox, workspace
 from agent_loop.tasks import Task, load_task
 
 NL = chr(10)
@@ -506,8 +508,12 @@ def test_no_personal_data_in_repo_files():
     assert not hits, hits
 
 
-def _docker_mode():
-    return mock.patch.object(checks, "SANDBOX", "docker")
+@contextlib.contextmanager
+def _docker_mode(verified=True):
+    """Pretend Docker is the sandbox. `verified` skips the one-per-process self-check probe,
+    which tests that mock subprocess would otherwise have to answer."""
+    with mock.patch.object(checks, "SANDBOX", "docker"), mock.patch.object(checks, "_VERIFIED", verified):
+        yield
 
 
 def test_requirement_validation_rejects_anything_but_plain_specifiers():
@@ -566,7 +572,9 @@ def test_project_tests_build_once_fail_closed_and_kill_on_timeout():
     kinds = [c[1] for c in calls]
     assert kinds == ["image", "build", "run"], kinds
     build = calls[1]
-    assert "BASE=python:3.12-slim" in build and build.index("-t") < len(build) - 1, build
+    base = f"BASE={checks.CONFIG['sandbox_image']}"
+    assert base in build and "@sha256:" in base, build      # the sandbox base is pinned by digest
+    assert build.index("-t") < len(build) - 1, build
 
     # hostile requirement never reaches docker
     calls.clear()
@@ -902,6 +910,397 @@ def test_task_file_protection_keys():
         except ValueError:
             continue
         raise AssertionError(bad)
+
+
+REFERENCE_SOLUTIONS = {
+    "slugify": ("textutil/slug.py", '''"""Turn a title into a URL slug."""
+import re
+import unicodedata
+
+
+def slugify(text):
+    folded = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "-", folded.lower()).strip("-")
+'''),
+    "wordwrap": ("wrapper/wrap.py", '''def wrap(text, width):
+    lines, line = [], ""
+    for word in text.split():
+        if not line:
+            line = word
+        elif len(line) + 1 + len(word) <= width:
+            line += " " + word
+        else:
+            lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    return lines
+'''),
+    "intervals": ("ivl/merge.py", '''def merge(intervals):
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+'''),
+    "csvrow": ("csvrow/parse.py", '''def parse_row(line):
+    fields, cur, i, quoted = [], [], 0, False
+    while i < len(line):
+        c = line[i]
+        if quoted:
+            if c == '"':
+                if line[i + 1:i + 2] == '"':
+                    cur.append('"')
+                    i += 1
+                else:
+                    quoted = False
+            else:
+                cur.append(c)
+        elif c == '"':
+            quoted = True
+        elif c == ",":
+            fields.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    fields.append("".join(cur))
+    return fields
+'''),
+}
+
+
+def _pytest_in(project_copy):
+    import os
+    env = {**os.environ, "PYTHONPATH": str(project_copy), "PYTHONDONTWRITEBYTECODE": "1"}
+    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                          cwd=project_copy, env=env, capture_output=True, encoding="utf-8",
+                          errors="replace")
+
+
+def test_shipped_eval_tasks_are_satisfiable_but_not_already_solved():
+    """Each eval project fails as shipped and passes with a reference solution, so a
+    failing attempt means the model failed and not that the task is broken."""
+    import pathlib, shutil, tempfile
+    repo = pathlib.Path(__file__).resolve().parent
+    names = sorted(p.stem for p in (repo / "evals").glob("*.yaml"))
+    assert names == ["csvrow", "fizzbuzz", "intervals", "palindrome", "slugify", "wordwrap"], names
+
+    for name, (rel, solution) in REFERENCE_SOLUTIONS.items():
+        spec = load_task(str(repo / "evals" / f"{name}.yaml"))
+        assert spec.kind == "project" and pathlib.Path(spec.project).is_dir(), spec
+        copy = pathlib.Path(tempfile.mkdtemp()) / name
+        shutil.copytree(spec.project, copy)
+        shipped = _pytest_in(copy)
+        assert shipped.returncode != 0, f"{name}: already passes as shipped\n{shipped.stdout}"
+        (copy / rel).write_bytes(solution.encode("utf-8"))
+        fixed = _pytest_in(copy)
+        assert fixed.returncode == 0, f"{name}: reference solution fails\n{fixed.stdout}"
+
+    good = {"palindrome": "def is_palindrome(s):" + NL + "    t = [c.lower() for c in s if c.isalnum()]"
+                          + NL + "    return t == t[::-1]",
+            "fizzbuzz": "def fizzbuzz(n):" + NL + "    return ['FizzBuzz' if i % 15 == 0 else 'Fizz' if i % 3 == 0 "
+                        "else 'Buzz' if i % 5 == 0 else str(i) for i in range(1, n + 1)]"}
+    for name, code in good.items():
+        spec = load_task(str(repo / "evals" / f"{name}.yaml"))
+        ok, out = checks.run_tests(code, spec.tests)
+        assert ok, (name, out)
+        ok, _ = checks.run_tests("def is_palindrome(s): return True" + NL + "def fizzbuzz(n): return []", spec.tests)
+        assert not ok, f"{name}: a stub passes the asserts"
+
+
+def test_summarize_format_and_compare_math():
+    def r(task, passed, laps=1, tokens=100, seconds=10.0, esc=False, result=None):
+        return {"task": task, "attempt": 1, "passed": passed, "laps": laps, "escalated": esc,
+                "total_tokens": tokens, "seconds": seconds,
+                "result": result or ("approved" if passed else "stopped by owner")}
+
+    a = {"label": "A", "attempts": 3, "results": [
+        r("t1", True, laps=1, tokens=100, seconds=10), r("t1", True, laps=3, tokens=300, seconds=30),
+        r("t1", False, tokens=200, seconds=20, esc=True),
+        r("t2", False), r("t2", False), r("t2", False, result="error")]}
+    rows = {x["task"]: x for x in evals.summarize(a["results"])}
+    assert rows["t1"]["passes"] == 2 and abs(rows["t1"]["rate"] - 2 / 3) < 1e-9, rows["t1"]
+    assert rows["t1"]["mean_laps_to_pass"] == 2.0 and rows["t1"]["escalated"] == 1, rows["t1"]
+    assert rows["t1"]["mean_tokens"] == 200 and rows["t1"]["mean_seconds"] == 20, rows["t1"]
+    assert rows["t2"]["passes"] == 0 and rows["t2"]["mean_laps_to_pass"] is None and rows["t2"]["errors"] == 1
+    assert rows["ALL"]["n"] == 6 and rows["ALL"]["passes"] == 2, rows["ALL"]
+    table = evals.format_table(list(rows.values()))
+    assert "2/3" in table and "0/3" in table and "ALL" in table and "-" in table, table
+
+    b = {"label": "B", "attempts": 3, "results": [r("t1", True)] * 3 + [r("t2", True), r("t2", False), r("t2", False)]
+         + [r("t3", True)]}
+    text = evals.compare(a, b)
+    assert "A = A   B = B" in text and "2/3 -> 3/3" in text and "+33%" in text, text
+    assert "0/3 -> 1/3" in text and "t3" in text and "only in B" in text, text
+    assert "noise" in text, text
+
+
+class PromptLLM:
+    """Replies by looking at the prompt, so one fake serves tasks that should differ."""
+
+    def __init__(self, fn):
+        self.fn, self.calls = fn, 0
+
+    def invoke(self, msg):
+        self.calls += 1
+        return SimpleNamespace(content=self.fn(msg), usage_metadata={"input_tokens": 10, "output_tokens": 5,
+                                                                    "total_tokens": 15})
+
+
+def _eval_tasks(tmp):
+    asserts = NL.join("  - '" + t.replace("'", "''") + "'" for t in checks.TESTS)
+    (tmp / "good.yaml").write_text("task: Write is_palindrome(s)." + NL + "tests:" + NL + asserts + NL, encoding="utf-8")
+    (tmp / "bad.yaml").write_text("task: BADTASK write is_palindrome(s)." + NL + "tests:" + NL + asserts + NL,
+                                  encoding="utf-8")
+    return [str(tmp / "bad.yaml"), str(tmp / "good.yaml")]
+
+
+def test_run_eval_end_to_end_with_fake_models_and_no_leaked_paths():
+    import json, pathlib, tempfile
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    files = _eval_tasks(tmp)
+    install()
+    agent_nodes.MODELS["worker"] = PromptLLM(lambda m: BROKEN if "BADTASK" in m else GOOD)
+    messages = []
+    report, path = evals.run_eval(files, 2, "unit test!", out_root=tmp / "out", progress=messages.append)
+
+    assert report["finished"] and len(report["results"]) == 4 and len(messages) == 4, report
+    rows = {x["task"]: x for x in evals.summarize(report["results"])}
+    assert rows["good"]["passes"] == 2 and rows["good"]["mean_laps_to_pass"] == 1, rows["good"]
+    assert rows["bad"]["passes"] == 0 and rows["bad"]["n"] == 2, rows["bad"]
+    good = next(x for x in report["results"] if x["task"] == "good")
+    assert good["total_tokens"] == 45 and good["result"] == "approved" and not good["escalated"], good
+    assert {"lead", "worker", "check", "reviewer"} <= set(good["node_seconds"]), good["node_seconds"]
+    bad = next(x for x in report["results"] if x["task"] == "bad")
+    assert bad["result"] == "stopped by owner" and bad["laps"] == agent_nodes.MAX_REJECTIONS, bad
+
+    assert path.parent == tmp / "out" and path.name.startswith("unit-test--"), path
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["results"] == report["results"] and saved["config"]["models"], saved
+    text = path.read_text(encoding="utf-8")
+    assert str(tmp) not in text and str(pathlib.Path.home()) not in text, "no local paths in the report"
+
+    try:
+        evals.run_eval(files, 1, "x", out_root=tmp / "out", only={"nope"})
+    except SystemExit as exc:
+        assert "nope" in str(exc), exc
+    else:
+        raise AssertionError("an unknown --only name must be an error")
+
+
+def test_run_eval_budget_stops_an_attempt_and_errors_do_not_stop_the_eval():
+    import pathlib, tempfile
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    files = _eval_tasks(tmp)[1:]                       # good.yaml only
+    install()
+    report, _ = evals.run_eval(files, 1, "budget", out_root=tmp / "out", budget=20, progress=lambda *_: None)
+    r = report["results"][0]
+    assert not r["passed"] and r["result"] == "over token budget", r
+    assert r["total_tokens"] == 30, r                  # lead + worker; the budget is checked per node
+
+    class Boom:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, msg):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("model fell over at " + str(pathlib.Path.home()) + "/secret")
+            return SimpleNamespace(content=GOOD, usage_metadata={"input_tokens": 1, "output_tokens": 1,
+                                                                 "total_tokens": 2})
+
+    install()
+    agent_nodes.MODELS["worker"] = Boom()
+    report, _ = evals.run_eval(files, 2, "boom", out_root=tmp / "out", progress=lambda *_: None)
+    first, second = report["results"]
+    assert first["result"] == "error" and not first["passed"] and "RuntimeError" in first["error"], first
+    assert str(pathlib.Path.home()) not in first["error"] and "~" in first["error"], first["error"]
+    assert second["passed"], second                    # the next attempt still ran
+    assert evals.summarize(report["results"])[-1]["errors"] == 1
+
+
+def test_config_override_and_model_preflight():
+    import pathlib, tempfile
+    from agent_loop import config
+    assert config.config_path({}) == config.DEFAULT_CONFIG_PATH
+    alt = pathlib.Path(tempfile.mkdtemp()) / "alt.yaml"
+    alt.write_text("models:" + NL + "  worker: ollama:other:1b" + NL, encoding="utf-8")
+    assert config.config_path({"AGENT_LOOP_CONFIG": str(alt)}) == alt.resolve()
+    try:
+        config.config_path({"AGENT_LOOP_CONFIG": str(alt.parent / "typo.yaml")})
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("a missing override must not silently fall back to the default models")
+    loaded = config.load_config(alt)
+    assert loaded["models"]["worker"] == "ollama:other:1b" and loaded["models"]["lead"] == "ollama:gemma3:4b"
+
+    tags = {"models": [{"name": "qwen2.5-coder:7b"}, {"name": "gemma3:4b"}, {"name": "tiny:latest"}]}
+    models = {"lead": "ollama:gemma3:4b", "worker": "ollama:qwen2.5-coder:7b",
+              "escalation": "ollama:qwen3:8b", "reviewer": "ollama:tiny"}
+    assert evals.missing_models(models, tags) == ["qwen3:8b"]
+    assert evals.missing_models({"w": "ollama:gemma3:4b"}, tags) == []
+
+
+def test_every_container_gets_the_full_lockdown():
+    import pathlib, tempfile
+    ws = pathlib.Path(tempfile.mkdtemp())
+    assert_cmd, project_cmd = checks._docker_cmd("n"), sandbox.project_docker_cmd("n", ws, "img", "pytest")
+    for cmd in (assert_cmd, project_cmd):
+        joined = " ".join(cmd)
+        for flag in ("--network none", "--ipc none", "--read-only", "noexec,nosuid,nodev", "--cap-drop ALL",
+                     "no-new-privileges", "--user 65534:65534", "--pull never", "--pids-limit",
+                     "nofile=1024", "core=0", "--label agent-loop=sandbox"):
+            assert flag in joined, (flag, joined)
+        assert cmd[cmd.index("--memory-swap") + 1] == cmd[cmd.index("--memory") + 1], "swap must equal memory"
+        assert "--privileged" not in cmd and "--pid" not in cmd and "docker.sock" not in joined, joined
+    # nothing is mounted into the assert sandbox; the project one mounts only the workspace, read-only
+    assert "--mount" not in assert_cmd and "-v" not in assert_cmd and "--volume" not in assert_cmd
+    mounts = [project_cmd[i + 1] for i, a in enumerate(project_cmd) if a in ("--mount", "-v", "--volume")]
+    assert len(mounts) == 1 and mounts[0].endswith("target=/work,readonly"), mounts
+
+
+def test_project_mount_rejects_paths_that_could_inject_mount_options():
+    import pathlib
+    for bad in ("C:/tmp/a,readonly=false", 'C:/tmp/a"b', "C:/tmp/a'b"):
+        try:
+            sandbox.project_docker_cmd("n", pathlib.Path(bad), "img", "pytest")
+        except ValueError as exc:
+            assert "unsafe" in str(exc), exc
+        else:
+            raise AssertionError(bad)
+
+
+def test_unisolated_sandbox_needs_an_explicit_override():
+    import pathlib, tempfile
+    from agent_loop import config
+    d = pathlib.Path(tempfile.mkdtemp())
+    local, junk = d / "local.yaml", d / "junk.yaml"
+    local.write_text("sandbox: local" + NL, encoding="utf-8")
+    junk.write_text("sandbox: nothing" + NL, encoding="utf-8")
+    try:
+        config.load_config(local, env={})
+    except ValueError as exc:
+        assert "NO isolation" in str(exc) and "AGENT_LOOP_ALLOW_LOCAL" in str(exc), exc
+    else:
+        raise AssertionError("a bare 'sandbox: local' must not load")
+    assert config.load_config(local, env={"AGENT_LOOP_ALLOW_LOCAL": "1"})["sandbox"] == "local"
+    for value in ("true", "yes", "0", ""):
+        try:
+            config.load_config(local, env={"AGENT_LOOP_ALLOW_LOCAL": value})
+        except ValueError:
+            continue
+        raise AssertionError(f"override accepted {value!r}")
+    try:
+        config.load_config(junk, env={})
+    except ValueError as exc:
+        assert "docker" in str(exc), exc
+    else:
+        raise AssertionError("an unknown sandbox value must be an error")
+    assert config.load_config(d / "missing.yaml", env={})["sandbox"] == "docker"
+    assert config.CONFIG["sandbox"] == "docker", "the shipped config.yaml must stay on docker"
+
+
+def test_self_check_runs_first_once_and_blocks_model_code_when_broken():
+    secret_code = "def f():" + NL + "    return 'MODEL_CODE_MARKER'"
+    seen = []
+
+    def healthy(cmd, **kw):
+        seen.append(kw.get("input"))
+        if kw.get("input") == checks.PROBE:
+            return SimpleNamespace(returncode=0, stdout="SANDBOX OK", stderr="")
+        return SimpleNamespace(returncode=0, stdout="ALL TESTS PASSED", stderr="")
+
+    with _docker_mode(verified=False), mock.patch.object(checks.subprocess, "run", healthy):
+        assert checks.run_tests(secret_code, ["assert f()"])[0]
+        assert seen[0] == checks.PROBE and "MODEL_CODE_MARKER" in seen[1], seen   # probe, then the code
+        assert checks.run_tests(secret_code, ["assert f()"])[0]
+        assert seen.count(checks.PROBE) == 1 and len(seen) == 3, "the probe runs once per process"
+
+    seen.clear()
+
+    def broken(cmd, **kw):
+        seen.append(kw.get("input"))
+        return SimpleNamespace(returncode=1, stdout="SANDBOX BROKEN: network reachable", stderr="")
+
+    with _docker_mode(verified=False), mock.patch.object(checks.subprocess, "run", broken):
+        ok, out = checks.run_tests(secret_code, ["assert f()"])
+        assert not ok and "NOT run" in out and "network reachable" in out, out
+        assert seen == [checks.PROBE], "model code must never reach a sandbox that failed its check"
+        assert not checks.verify_sandbox()[0] and len(seen) == 2, "a failed check is not cached as a pass"
+
+    seen.clear()
+    ws = __import__("pathlib").Path(__import__("tempfile").mkdtemp())
+    with _docker_mode(verified=False), mock.patch.object(checks.subprocess, "run", broken):
+        ok, out = sandbox.run_project_tests(ws, "pytest", [])
+        assert not ok and "NOT run" in out and seen == [checks.PROBE], (out, seen)
+
+    def hangs(cmd, **kw):
+        if cmd[:2] == ["docker", "run"]:
+            raise subprocess.TimeoutExpired(cmd, 1)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with _docker_mode(verified=False), mock.patch.object(checks.subprocess, "run", hangs):
+        ok, out = checks.run_tests(secret_code, ["assert f()"])
+    assert not ok and "timed out" in out and "NOT run" in out, out
+
+
+def test_real_docker_self_check_passes_and_really_detects_a_weak_container():
+    if not _docker_up():
+        print("  (docker not available - skipped)")
+        return
+    with _docker_mode(verified=False):
+        ok, msg = checks.verify_sandbox()
+        assert ok, msg
+    # The probe is only worth anything if it fails on a container that is NOT locked down.
+    weak = subprocess.run(
+        ["docker", "run", "--rm", "-i", "--pull", "never", checks.CONFIG["sandbox_image"], "python", "-I", "-"],
+        input=checks.PROBE, capture_output=True, encoding="utf-8", errors="replace")
+    assert weak.returncode == 1 and "SANDBOX BROKEN" in weak.stdout, weak.stdout
+    assert "runs as root" in weak.stdout and "capabilities not dropped" in weak.stdout, weak.stdout
+    assert "no-new-privileges not set" in weak.stdout, weak.stdout
+
+
+def test_credential_files_are_not_copied_and_key_shaped_content_refuses_the_project():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    fake_key = "sk-" + "A" * 24
+    src = _project(root / "src", {"app.py": "x = 1" + NL, ".env": "TOKEN=abc" + NL, ".env.local": "A=1" + NL,
+                                  "deploy.pem": "pem", "id_rsa": "rsa", "sub/credentials.json": "{}",
+                                  "tests/test_app.py": "def test(): pass" + NL})
+    skipped = workspace.copy_project(src, root / "ws", max_bytes=100_000)
+    assert skipped == [".env", ".env.local", "deploy.pem", "id_rsa", "sub/credentials.json"], skipped
+    assert workspace.project_files(root / "ws") == ["app.py", "tests/test_app.py"]
+    assert not (root / "ws" / ".env").exists() and not (root / "ws" / "id_rsa").exists()
+
+    leaky = _project(root / "leaky", {"config.py": f'API_KEY = "{fake_key}"' + NL})
+    try:
+        workspace.copy_project(leaky, root / "ws2", max_bytes=100_000)
+    except workspace.WorkspaceError as exc:
+        assert "config.py" in str(exc) and fake_key not in str(exc), exc    # names the file, never the secret
+    else:
+        raise AssertionError("a key-shaped string must refuse the project")
+    assert not (root / "ws2").exists(), "nothing is copied when the project is refused"
+
+    pem = _project(root / "pem", {"notes.txt": "-----BEGIN RSA PRIVATE KEY-----" + NL + "abc" + NL})
+    try:
+        workspace.copy_project(pem, root / "ws3", max_bytes=100_000)
+    except workspace.WorkspaceError:
+        pass
+    else:
+        raise AssertionError("a private key block must refuse the project")
+
+
+def test_thread_ids_stay_plain():
+    from agent_loop import runs
+    for good in ("live-slug2", "a.b_c-1", "x", "eval-20261029-164049-baba-slugify-1", "A" * 80):
+        assert runs.valid_thread(good), good
+    for bad in ("", "../x", "a/b", "a" + chr(92) + "b", "a,b", ".hidden", "a b", "A" * 81, "a..b", "x;y", "-x"):
+        assert not runs.valid_thread(bad), bad
+    assert runs.valid_thread(runs.new_thread_id("some task!! name")), "generated ids are always valid"
 
 
 def test_non_cp1252_code_and_output_do_not_crash_the_check():

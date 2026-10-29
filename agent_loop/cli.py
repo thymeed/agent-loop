@@ -1,6 +1,7 @@
 import argparse
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,12 +46,16 @@ def run(task: str | None, *, tests: list[str] | None = None,
         runs_dir: Path | None = None, continue_thread: bool = False,
         project: str | None = None, test_command: str = "pytest -q",
         requirements: list[str] | None = None,
-        protected: list[str] | None = None) -> dict:
+        protected: list[str] | None = None,
+        timings: dict[str, float] | None = None,
+        max_tokens: int | None = None) -> dict:
     """Drive the graph through interrupts until END; returns the final state.
 
     `app` is the compiled graph (default: in-memory). With `runs_dir` set, the final
     state is saved there. `continue_thread` picks up a saved thread instead of
-    starting one (after a crash, or a run stopped with --max-pauses).
+    starting one (after a crash, or a run stopped with --max-pauses). `timings`, if
+    given, is filled with wall seconds per node. `max_tokens` stops the run at the
+    first node boundary after the total passes it (a node already running finishes).
     """
     app = app or graph
     cfg = {"configurable": {"thread_id": thread}}
@@ -75,15 +80,29 @@ def run(task: str | None, *, tests: list[str] | None = None,
         else:
             inputs["tests"] = tests or TESTS
     pauses = 0
+    used = 0
+    over_budget = False
 
     while True:
+        clock = time.monotonic()  # reset per stream so an owner's thinking time is not a node's
         for step in app.stream(inputs, cfg):
+            now = time.monotonic()
             for node, update in step.items():
                 if node == "__interrupt__":
                     pauses += 1
                     print(f"PAUSED #{pauses} - owner call needed: {update[0].value}\n")
                 else:
                     print_step(node, update)
+                    if timings is not None:
+                        timings[node] = timings.get(node, 0.0) + (now - clock)
+                    used += sum(c.get("total", 0) for c in (update or {}).get("tokens", {}).values())
+            clock = now
+            if max_tokens is not None and used > max_tokens:
+                over_budget = True
+                break
+        if over_budget:
+            print(f"stopping: {used} tokens used, over the budget of {max_tokens}\n")
+            break
 
         state = app.get_state(cfg)
         if not state.next:
@@ -95,6 +114,8 @@ def run(task: str | None, *, tests: list[str] | None = None,
         inputs = Command(resume=_owner_call(resume_with))
 
     values = app.get_state(cfg).values
+    if over_budget:
+        values = {**values, "outcome": f"over token budget: used {used} of {max_tokens}"}
     print_tokens(values.get("tokens", {}))
     print(f"pauses={pauses} approved={values.get('approved')} "
           f"rejections={values.get('rejections')} tests_passed={values.get('tests_passed')} "
@@ -155,6 +176,9 @@ def main() -> None:
     ap.add_argument("--max-pauses", type=int, default=None,
                     help="stop after N interrupts instead of looping forever")
     args = ap.parse_args()
+    for given in (args.thread, args.continue_thread):
+        if given and not runs.valid_thread(given):
+            ap.error("thread ids may only use letters, digits, '.', '_' and '-' (max 80)")
     if args.cap and args.task_files:
         ap.error("--cap only applies to the built-in palindrome task")
     if args.continue_thread and (args.task_files or args.cap or args.thread):

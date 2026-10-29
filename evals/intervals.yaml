@@ -1,0 +1,6 @@
+type: project
+task: >-
+  Implement ivl.merge(intervals): merge overlapping or touching (start, end) intervals and
+  return them sorted by start as a list of tuples. The input may be unsorted and must not
+  be modified. An empty input gives an empty list. Do not change the tests.
+project: projects/intervals

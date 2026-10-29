@@ -1,0 +1,6 @@
+type: project
+task: >-
+  Improve textutil.slugify so it folds accented letters to ASCII (Café -> cafe),
+  turns every run of non-alphanumeric characters into a single dash, and trims
+  dashes from both ends. Do not change the tests.
+project: projects/slugify

@@ -17,6 +17,7 @@ from .config import CONFIG
 
 DOCKERFILE = Path(__file__).resolve().parent.parent / "sandbox" / "Dockerfile"
 BUILD_TIMEOUT = 600
+UNSAFE_MOUNT_CHARS = (",", '"', "'", chr(10), chr(13))
 OUTPUT_TAIL = 3000
 
 # One requirement: name, optional [extras], optional version clauses. No URLs, markers,
@@ -74,15 +75,15 @@ def _test_argv(command: str) -> list[str]:
 
 
 def project_docker_cmd(name: str, workspace: Path, image: str, command: str) -> list[str]:
+    source = str(Path(workspace).resolve())
+    if any(ch in source for ch in UNSAFE_MOUNT_CHARS):
+        # --mount takes comma-separated key=value options; a comma would inject more of them.
+        raise ValueError(f"workspace path has characters that are unsafe in a docker mount: {source!r}")
     return [
         "docker", "run", "--rm", "--name", name,
-        "--network", "none",
-        "--read-only", "--tmpfs", "/tmp:size=64m",
-        "--memory", CONFIG["project_memory"], "--cpus", str(CONFIG["sandbox_cpus"]),
-        "--pids-limit", "256",
-        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--user", "65534:65534",
-        "--mount", f"type=bind,source={Path(workspace).resolve()},target=/work,readonly",
+        *checks.lockdown_flags(memory=CONFIG["project_memory"], cpus=CONFIG["sandbox_cpus"],
+                               pids=256, tmp_mb=64),
+        "--mount", f"type=bind,source={source},target=/work,readonly",
         "-w", "/work",
         "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "PYTHONPATH=/work:/work/src", "-e", "HOME=/tmp",
         image, *_test_argv(command),
@@ -94,6 +95,9 @@ def run_project_tests(workspace: Path, command: str, requirements: list[str]) ->
     if checks.SANDBOX != "docker":
         return False, "project tasks need `sandbox: docker` in config.yaml (no local mode for real projects)"
     timeout = CONFIG["project_test_timeout"]
+    safe, why = checks.verify_sandbox()  # same lockdown flags; refuse to run anything if it is not real
+    if not safe:
+        return False, why
     try:
         image = ensure_image(requirements)
         name = f"agent-loop-{uuid.uuid4().hex[:12]}"

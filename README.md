@@ -146,13 +146,46 @@ limits, all capabilities dropped, non-root user, script passed over stdin (nothi
 mounted). On timeout the container is killed by name. If Docker is missing the
 check fails closed with an install hint.
 
-`sandbox: local` runs a plain `python -I` subprocess instead. `-I` only isolates
-import paths: that code runs as your user with your files, environment and
-network. Use it only for trusted toy tasks.
+`sandbox: local` runs a plain `python -I` subprocess instead. That code runs as your
+user with your files, environment and network, so the config refuses to load unless
+you also set the environment variable `AGENT_LOOP_ALLOW_LOCAL=1`. Project tasks never
+run locally. The offline test suite sets it internally and only ever runs fixed code.
 
-The image is pulled on first use; to pre-pull: `docker pull python:3.12-slim`.
+The image is pinned by digest in `config.yaml`. To refresh it on purpose:
+`docker pull python:3.12-slim`, then copy the digest from
+`docker image inspect python:3.12-slim` into `sandbox_image`.
 The sandbox is exercised against real Docker by `_smoke_test.py` whenever the
-daemon is running (skipped otherwise).
+daemon is running (skipped otherwise, so a green run without Docker proves less).
+
+## Safety
+
+Model-written code is the threat. These layers apply on every run:
+
+1. **Container.** No network or IPC, read-only root, a small `noexec` tmpfs, no
+   swap, memory/CPU/process/file limits, all capabilities dropped,
+   `no-new-privileges`, non-root user, no image pull at run time, nothing mounted
+   except (project tasks) the workspace copy, read-only.
+2. **Self-check.** Before the first model code of a process runs, a probe runs inside
+   the real container and verifies root, capabilities, `no-new-privileges`, network,
+   root-filesystem writes, visible host paths and cgroup limits. If anything is off
+   the run stops and says the model code was not run.
+3. **Pinned image.** `sandbox_image` is a digest, not a tag.
+4. **No silent unisolated mode.** `sandbox: local` needs `AGENT_LOOP_ALLOW_LOCAL=1`.
+5. **Your project is a copy.** Files that look like credentials (`.env*`, `*.pem`,
+   `*.key`, `id_rsa*`, `.npmrc`, ...) are not copied, and a project containing a
+   key-shaped string or private key block is refused. Worker file paths are validated
+   (no `..`, absolute paths, drive letters, symlinks, `.git`), and the tests are
+   read-only to the worker.
+6. **Plain names.** Thread ids (`--thread`, `--continue`) become folders and mount
+   paths, so they allow only letters, digits, `.`, `_` and `-`.
+7. **Bounded.** A rejection cap, one escalation per cap, test timeouts, and
+   `--budget` tokens per eval attempt.
+
+What this does not give you: a container shares a kernel with its host (Docker
+Desktop's WSL2 VM, here), so an escape is unlikely but not impossible. The image
+build step has network access (that is where `requirements:` are installed). Stronger
+isolation is outside this repo: run everything in a dedicated WSL2 distro with the
+Windows drives and interop turned off, ideally with rootless Docker.
 
 ## Layout
 

@@ -1,0 +1,9 @@
+task: >-
+  Write fizzbuzz(n) in Python that returns a list of strings for 1..n:
+  "Fizz" for multiples of 3, "Buzz" for multiples of 5, "FizzBuzz" for both,
+  otherwise the number as a string.
+tests:
+  - 'assert fizzbuzz(0) == []'
+  - 'assert fizzbuzz(5) == ["1", "2", "Fizz", "4", "Buzz"]'
+  - 'assert fizzbuzz(15)[-1] == "FizzBuzz"'
+  - 'assert fizzbuzz(3) == ["1", "2", "Fizz"]'

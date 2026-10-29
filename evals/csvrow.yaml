@@ -1,0 +1,7 @@
+type: project
+task: >-
+  Implement csvrow.parse_row(line): split one CSV line into a list of string fields.
+  Fields are separated by commas. A field may be wrapped in double quotes, in which case
+  it can contain commas and a doubled quote ("") stands for one literal quote. Do not
+  strip spaces and do not use the csv module. Do not change the tests.
+project: projects/csvrow

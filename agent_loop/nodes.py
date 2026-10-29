@@ -60,8 +60,11 @@ def prepare(s: State):
     if not dest.exists():  # a resumed run keeps the files the worker already changed
         partial = dest.with_name(dest.name + ".partial")
         shutil.rmtree(partial, ignore_errors=True)
-        workspace.copy_project(Path(s["project_dir"]), partial, max_bytes=CONFIG["max_project_bytes"])
+        skipped = workspace.copy_project(Path(s["project_dir"]), partial,
+                                         max_bytes=CONFIG["max_project_bytes"])
         os.replace(partial, dest)
+        if skipped:
+            print("note: not copied into the workspace (look like credentials): " + ", ".join(skipped))
     return {}
 
 
