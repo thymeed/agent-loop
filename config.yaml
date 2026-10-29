@@ -1,0 +1,8 @@
+# Per-role models as "provider:model". Only the ollama provider exists so far.
+models:
+  lead: ollama:gemma3:4b
+  worker: ollama:gemma3:4b
+  reviewer: ollama:gemma3:4b
+
+max_rejections: 3
+test_timeout: 15

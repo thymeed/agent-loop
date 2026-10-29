@@ -37,3 +37,9 @@ to your files, environment, and network. Fine for a toy like `is_palindrome`;
 before giving it real tasks, run `check` inside WSL or Docker, or at minimum in
 a throwaway temp directory under a restricted user.
 
+
+## Layout
+
+- `loop.py` — entry point.
+- `config.yaml` — per-role models (`provider:model`), rejection cap, test timeout.
+- `agent_loop/` — `state.py`, `checks.py`, `nodes.py`, `graph.py`, `cli.py`, `config.py`.
