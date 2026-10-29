@@ -1,16 +1,20 @@
 import argparse
+import sys
 from typing import Any
 
 from langgraph.types import Command
 
 from .checks import IMPOSSIBLE_TESTS, TESTS
 from .graph import graph
+from .tasks import Task, load_task
 
 
 def print_step(node: str, update: dict) -> None:
     shown = {}
     for key, value in update.items():
-        if isinstance(value, str) and len(value) > 700:
+        if key == "sources":
+            shown[key] = [f"{p['id']} {p['title'][:60]}" for p in value]
+        elif isinstance(value, str) and len(value) > 700:
             shown[key] = value[:700] + f"... ({len(value)} chars)"
         else:
             shown[key] = value
@@ -31,12 +35,17 @@ def print_tokens(tokens: dict[str, dict[str, int]]) -> None:
 
 
 def run(task: str, *, tests: list[str] | None = None,
+        kind: str = "code", query: str | None = None, max_papers: int = 8,
         resume_with: str | None = None, thread: str = "1",
         max_pauses: int | None = None) -> dict:
     """Drive the graph through interrupts until END; returns the final state."""
     cfg = {"configurable": {"thread_id": thread}}
     # Tests travel in state, so a --cap run cannot leak into later runs.
-    inputs: Any = {"task": task, "rejections": 0, "tests": tests or TESTS}
+    inputs: Any = {"task": task, "rejections": 0, "type": kind}
+    if kind == "research":
+        inputs.update(query=query, max_papers=max_papers)
+    else:
+        inputs["tests"] = tests or TESTS
     pauses = 0
 
     while True:
@@ -67,7 +76,12 @@ def run(task: str, *, tests: list[str] | None = None,
 
 
 def main() -> None:
+    # Paper titles and model output are not cp1252-safe on Windows consoles.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
+    ap.add_argument("task_file", nargs="?", default=None,
+                    help="YAML file with `task` and `tests` (asserts); "
+                         "default is the built-in palindrome task")
     ap.add_argument("--cap", action="store_true",
                     help="swap in an impossible assert to force the 3-rejection cap")
     ap.add_argument("--resume", metavar="TEXT", default=None,
@@ -77,10 +91,21 @@ def main() -> None:
     ap.add_argument("--max-pauses", type=int, default=None,
                     help="stop after N interrupts instead of looping forever")
     args = ap.parse_args()
+    if args.cap and args.task_file:
+        ap.error("--cap only applies to the built-in palindrome task")
+
+    if args.task_file:
+        spec = load_task(args.task_file)
+    else:
+        spec = Task("Write is_palindrome(s) in Python that ignores case and spaces.",
+                    tests=IMPOSSIBLE_TESTS if args.cap else None)
 
     run(
-        "Write is_palindrome(s) in Python that ignores case and spaces.",
-        tests=IMPOSSIBLE_TESTS if args.cap else None,
+        spec.task,
+        tests=spec.tests,
+        kind=spec.kind,
+        query=spec.query,
+        max_papers=spec.max_papers,
         resume_with=args.resume,
         thread=args.thread,
         max_pauses=args.max_pauses,

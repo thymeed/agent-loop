@@ -1,6 +1,7 @@
 from langgraph.graph import END
 from langgraph.types import interrupt
 
+from . import research
 from .checks import TESTS, extract_code, run_tests
 from .config import CONFIG, make_llm
 from .state import State, usage
@@ -26,36 +27,77 @@ def lead(s: State):
     return {"plan": resp.content.strip(), "tokens": {"lead": usage(resp)}}
 
 
+def search(s: State):
+    """Research mode: fetch the papers the answer has to be grounded in."""
+    papers = research.fetch_papers(s["query"], s.get("max_papers", 8))
+    return {"sources": papers}
+
+
+def is_research(s: State) -> bool:
+    return s.get("type") == "research"
+
+
+def after_lead(s: State):
+    return "search" if is_research(s) else "worker"
+
+
 def worker(s: State):
-    msg = (
-        f"Task: {s['task']}\n"
-        f"Plan: {s['plan']}\n"
-        f"Last review: {s.get('review', 'none')}\n"
-        "Write the solution."
-    )
+    if is_research(s):
+        msg = (
+            f"Task: {s['task']}\n"
+            f"Plan: {s['plan']}\n"
+            f"Papers (your ONLY allowed source):\n{research.format_papers(s['sources'])}\n\n"
+            f"Last review: {s.get('review', 'none')}\n"
+            f"Last citation check: {s.get('test_output', 'none')}\n"
+            "Answer the task using only these papers. Support every claim by citing the paper "
+            'as [arXiv:ID] and copying an exact phrase of at least 4 words from its abstract '
+            'in double quotes in the same paragraph. Every paper you cite needs at least one '
+            "such quote. Do not use outside knowledge and do not cite other papers."
+        )
+    else:
+        msg = (
+            f"Task: {s['task']}\n"
+            f"Plan: {s['plan']}\n"
+            f"Last review: {s.get('review', 'none')}\n"
+            "Write the solution."
+        )
     resp = MODELS["worker"].invoke(msg)
     return {"work": resp.content, "tokens": {"worker": usage(resp)}}
 
 
 def check(s: State):
-    """Deterministic gate: actually execute the worker's code against the tests."""
+    """Deterministic gate: run the code against the tests, or verify the citations."""
+    if is_research(s):
+        passed, output = research.check_citations(s.get("work", ""), s["sources"])
+        return {"tests_passed": passed, "test_output": output}
     code = extract_code(s.get("work", ""))
     passed, output = run_tests(code, s.get("tests"))
     return {"code": code, "tests_passed": passed, "test_output": output}
 
 
 def reviewer(s: State):
-    tests = s.get("tests") or TESTS
-    msg = (
-        f"Task: {s['task']}\n"
-        f"Plan:\n{s['plan']}\n"
-        f"Solution:\n{s['work']}\n\n"
-        f"Automated tests run by the harness:\n" + "\n".join(tests) + "\n"
-        f"Test result: {'PASSED' if s.get('tests_passed') else 'FAILED'}\n"
-        f"Test output:\n{s.get('test_output', '')}\n\n"
-        "Check the solution against the task. Your reply MUST start with the "
-        f"single word {APPROVED_TAG} or REJECTED, then a short reason."
-    )
+    if is_research(s):
+        msg = (
+            f"Task: {s['task']}\n"
+            f"Answer:\n{s['work']}\n\n"
+            f"Citation check: {'PASSED' if s.get('tests_passed') else 'FAILED'}\n"
+            f"{s.get('test_output', '')}\n\n"
+            "Judge whether the answer addresses the task and whether the claims follow "
+            "from the quoted evidence. Your reply MUST start with the single word "
+            f"{APPROVED_TAG} or REJECTED, then a short reason."
+        )
+    else:
+        tests = s.get("tests") or TESTS
+        msg = (
+            f"Task: {s['task']}\n"
+            f"Plan:\n{s['plan']}\n"
+            f"Solution:\n{s['work']}\n\n"
+            f"Automated tests run by the harness:\n" + "\n".join(tests) + "\n"
+            f"Test result: {'PASSED' if s.get('tests_passed') else 'FAILED'}\n"
+            f"Test output:\n{s.get('test_output', '')}\n\n"
+            "Check the solution against the task. Your reply MUST start with the "
+            f"single word {APPROVED_TAG} or REJECTED, then a short reason."
+        )
     resp = MODELS["reviewer"].invoke(msg)
     text = resp.content.strip()
     model_ok = text.upper().startswith(APPROVED_TAG)

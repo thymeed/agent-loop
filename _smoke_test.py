@@ -9,8 +9,10 @@ from unittest import mock
 
 from langgraph.types import Command
 
-from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes
+from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes, research
+from agent_loop.tasks import Task, load_task
 
+NL = chr(10)
 checks.SANDBOX = "local"  # offline suite never needs Docker
 
 GOOD = """```python
@@ -144,6 +146,138 @@ def test_cap_run_does_not_leak_tests_into_later_runs():
     install()
     passed = cli.run("is_palindrome", thread="leak-after")
     assert passed["approved"] is True and passed["tests_passed"] is True
+
+
+def test_load_task_file():
+    import pathlib, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    ok = d / 'ok.yaml'
+    ok.write_text(NL.join(['task: Add two numbers', 'tests:', "  - 'assert add(1, 2) == 3'"]), encoding='utf-8')
+    assert load_task(str(ok)) == Task('Add two numbers', 'code', tests=['assert add(1, 2) == 3'])
+    for name, body in [('empty.yaml', 'task: x' + NL + 'tests: []'),
+                       ('notests.yaml', 'task: x'),
+                       ('list.yaml', '- a')]:
+        bad = d / name
+        bad.write_text(body, encoding='utf-8')
+        try:
+            load_task(str(bad))
+        except ValueError:
+            continue
+        raise AssertionError(name + ' should be rejected')
+
+    # the shipped example is valid and a correct solution passes its asserts
+    tests = load_task('tasks/fizzbuzz.yaml').tests
+    code = ('def fizzbuzz(n):' + NL + '    return ["FizzBuzz" if i % 15 == 0 else "Fizz" if i % 3 == 0 '
+            'else "Buzz" if i % 5 == 0 else str(i) for i in range(1, n + 1)]')
+    passed, out = checks.run_tests(code, tests)
+    assert passed, out
+
+
+FEED = """<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2312.00752v2</id>
+    <published>2023-12-01T17:00:00Z</published>
+    <title>Mamba:  Linear-Time Sequence
+      Modeling</title>
+    <summary>  Selective state spaces scale linearly in sequence length.
+      Open problems remain for in-context recall.  </summary>
+    <author><name>Albert Gu</name></author>
+    <author><name>Tri Dao</name></author>
+  </entry>
+</feed>"""
+
+PAPERS = research.parse_feed(FEED)
+
+
+def test_parse_feed():
+    assert len(PAPERS) == 1
+    p = PAPERS[0]
+    assert p["id"] == "2312.00752", p
+    assert p["title"] == "Mamba: Linear-Time Sequence Modeling", p
+    assert p["authors"] == ["Albert Gu", "Tri Dao"] and p["published"] == "2023-12-01"
+    assert "Open problems remain for in-context recall." in p["abstract"], p
+
+
+def test_citation_check():
+    inline = 'Recall is open [arXiv:2312.00752v2 "Open problems remain for in-context recall"].'
+    ok, out = research.check_citations(inline, PAPERS)
+    assert ok and "1 CITED PAPERS" in out, out
+
+    # a quote next to the citation instead of inside the bracket, with curly quotes
+    prose = 'Selective state spaces [arXiv:2312.00752] note “scale linearly in sequence length”.'
+    ok, out = research.check_citations(prose, PAPERS)
+    assert ok, out
+
+    cases = {
+        "no citations at all": "no citations found",
+        'x [arXiv:9999.99999] "scale linearly in sequence length"': "not one of the fetched papers",
+        'x [arXiv:2312.00752] "SSMs beat transformers on everything"': "quote not found",
+        'x [arXiv:2312.00752] "scale linearly"': "cited but no verified quote",
+        "x [arXiv:2312.00752]": "cited but no verified quote",
+        # right quote, wrong paragraph: it is not next to a citation of that paper
+        'Quote: "scale linearly in sequence length".' + NL + NL + "Cites [arXiv:2312.00752].":
+            "cited but no verified quote",
+    }
+    for answer, expected in cases.items():
+        ok, out = research.check_citations(answer, PAPERS)
+        assert not ok and expected in out, (answer, out)
+
+    # ellipses and trailing commas inside the quote marks are tolerated, per fragment
+    elided = 'Papers [arXiv:2312.00752] say "...Selective state spaces scale linearly ... for in-context recall,"'
+    ok, out = research.check_citations(elided, PAPERS)
+    assert ok, out
+
+    mixed = inline + ' But [arXiv:2312.00752] "made up words that are not here".'
+    ok, out = research.check_citations(mixed, PAPERS)
+    assert not ok and "quote not found" in out, out
+
+
+def test_research_task_validation():
+    import pathlib, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    ok = d / "ok.yaml"
+    ok.write_text(NL.join(["type: research", "task: Survey SSMs", "query: ssm"]), encoding="utf-8")
+    t = load_task(str(ok))
+    assert (t.kind, t.query, t.max_papers, t.tests) == ("research", "ssm", 8, None), t
+    for name, lines in {
+        "noquery.yaml": ["type: research", "task: x"],
+        "bigmax.yaml": ["type: research", "task: x", "query: q", "max_papers: 500"],
+        "badtype.yaml": ["type: poem", "task: x"],
+    }.items():
+        bad = d / name
+        bad.write_text(NL.join(lines), encoding="utf-8")
+        try:
+            load_task(str(bad))
+        except ValueError:
+            continue
+        raise AssertionError(name + " should be rejected")
+    shipped = load_task("tasks/ssm_moe.yaml")
+    assert shipped.kind == "research" and shipped.query
+
+
+def test_research_run_end_to_end_with_fakes():
+    cited = 'Recall is open [arXiv:2312.00752] "Open problems remain for in-context recall".'
+    fabricated = 'Transformers are dead [arXiv:2312.00752] "SSMs beat transformers on everything".'
+    searched = []
+
+    def fake_fetch(query, max_papers):
+        searched.append((query, max_papers))
+        return PAPERS
+
+    with mock.patch.object(research, "fetch_papers", fake_fetch):
+        install(code=cited, review="APPROVED: grounded")
+        run = cli.run("Survey SSMs", kind="research", query="ssm", max_papers=3, thread="research-ok")
+        assert run["approved"] and run["tests_passed"] and run["rejections"] == 0, run
+        assert searched == [("ssm", 3)], searched
+
+        # An approving reviewer cannot rescue a fabricated quote.
+        worker, _ = install(code=fabricated, review="APPROVED: looks great")
+        run = cli.run("Survey SSMs", kind="research", query="ssm",
+                      resume_with="stop", thread="research-bad")
+        assert not run["approved"] and run["outcome"].startswith("stopped by owner"), run
+        assert "quote not found" in run["test_output"], run
+        assert worker.calls == agent_nodes.MAX_REJECTIONS, worker.calls
 
 
 def _docker_mode():

@@ -1,0 +1,7 @@
+type: research
+task: >-
+  Based on these recent papers, what open problems or needed breakthroughs
+  do they identify for state space models and mixture-of-experts models?
+# Passed to arXiv verbatim, so use its syntax: quoted phrases, AND/OR, field prefixes.
+query: '(abs:"state space model" OR abs:"mamba") AND abs:"mixture of experts"'
+max_papers: 8

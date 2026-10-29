@@ -20,6 +20,10 @@ class State(TypedDict):
     tests_passed: bool
     test_output: str
     tests: list[str]
+    type: NotRequired[str]     # "code" (default) or "research"
+    query: NotRequired[str]
+    max_papers: NotRequired[int]
+    sources: list[dict]        # research: fetched arXiv papers
     approved: bool
     rejections: int
     outcome: str
