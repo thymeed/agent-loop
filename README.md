@@ -84,6 +84,35 @@ tests:
 
 See `tasks/fizzbuzz.yaml`. `--cap` only works with the built-in task.
 
+## Project tasks
+
+`type: project` points the loop at a real directory and gates the result on the
+project's own tests (`tasks/fix_slugify.yaml`, demo in `projects/slugify_demo/`):
+
+```yaml
+type: project
+task: Make slugify() fold accents and collapse repeated dashes.
+project: ../projects/slugify_demo   # relative to the task file
+test_command: pytest -q             # default
+requirements: ['six==1.17.0']       # optional; installed at image build time only
+```
+
+- Your project is never written. It is copied to `runs/<thread>/workspace`; the worker
+  replies with whole files (` ```path/to/file.py ` blocks), which are applied only if the
+  path is relative and inside the project (no `..`, drive letters, symlinks or `.git`).
+  A bad path fails the lap; nothing from that reply is tested.
+- Tests run with `pytest` in the Docker sandbox: workspace mounted read-only, no network.
+  Packages in `requirements:` are installed while the image is built, never at test time.
+- **The worker cannot edit the tests.** `test_*.py`, `tests/`, `conftest.py`, `pytest.ini`,
+  `pyproject.toml` and similar are protected: edits to them are ignored (the rest of the
+  reply still counts) and checked again by content before every test run. Add globs with
+  `protected: [...]`, or turn it off with `allow_test_edits: true` for tasks that need
+  new tests.
+- The result is `runs/<thread>/changes.patch`. Review it, then `git apply` it yourself
+  from the project directory.
+- Limits: Python and pytest only; small models often fail the whole-file format on
+  large files; the worker sees about `max_context_chars` of the project per prompt.
+
 ## Research mode
 
 `type: research` tasks answer from recent arXiv papers instead of writing code

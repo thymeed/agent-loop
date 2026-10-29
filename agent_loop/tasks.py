@@ -4,6 +4,7 @@ from pathlib import Path
 import yaml
 
 from .sandbox import validate_requirements
+from .workspace import DEFAULT_PROTECTED
 
 
 @dataclass
@@ -16,6 +17,8 @@ class Task:
     project: str | None = None            # project only: absolute path of the original
     test_command: str = "pytest -q"
     requirements: list[str] = field(default_factory=list)
+    # globs the worker may not write; empty only when the task sets `allow_test_edits: true`
+    protected: list[str] = field(default_factory=lambda: list(DEFAULT_PROTECTED))
 
 
 def _text(data: dict, key: str, path: str) -> str:
@@ -58,6 +61,13 @@ def load_task(path: str) -> Task:
             requirements = validate_requirements(requirements)
         except ValueError as exc:
             raise ValueError(f"{path}: {exc}") from exc
+        extra = data.get("protected", [])
+        if not isinstance(extra, list) or not all(isinstance(g, str) and g.strip() for g in extra):
+            raise ValueError(f"{path}: 'protected' must be a list of glob strings")
+        allow = data.get("allow_test_edits", False)
+        if not isinstance(allow, bool):
+            raise ValueError(f"{path}: 'allow_test_edits' must be true or false")
+        protected = [] if allow else [*DEFAULT_PROTECTED, *(g.strip() for g in extra)]
         return Task(task, "project", project=str(project), test_command=command.strip(),
-                    requirements=requirements)
+                    requirements=requirements, protected=protected)
     raise ValueError(f"{path}: 'type' must be 'code', 'research' or 'project', got {kind!r}")

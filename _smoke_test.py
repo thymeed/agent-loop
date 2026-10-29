@@ -766,6 +766,144 @@ def test_real_docker_project_run_end_to_end_with_fake_models():
     assert not left, left
 
 
+def test_protected_globs_match_tests_and_test_config_only():
+    p = workspace.DEFAULT_PROTECTED
+    for protected in ["test_calc.py", "pkg/test_calc.py", "calc_test.py", "conftest.py", "pkg/conftest.py",
+                      "tests/test_x.py", "tests/helpers.py", "tests/sub/data.py", "pkg/tests/helpers.py",
+                      "test/x.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+                      "TESTS/Test_X.py", "pkg/PYTEST.INI"]:
+        assert workspace.is_protected(protected, p), protected
+    for free in ["calc.py", "textutil/slug.py", "src/app.py", "latest.py", "contest.py", "docs/tests.md",
+                 "pkg/attest.py"]:
+        assert not workspace.is_protected(free, p), free
+    assert not workspace.is_protected("tests/test_x.py", [])
+
+
+def test_apply_blocks_refuses_protected_files_unless_allowed():
+    import pathlib, tempfile
+    ws = _project(pathlib.Path(tempfile.mkdtemp()) / "ws", dict(BUGGY))
+    reply = NL.join(FENCE + name + NL + "x = 1" + NL + FENCE for name in
+                    ["test_calc.py", "conftest.py", "tests/test_new.py", "pkg/tests/helpers.py",
+                     "pytest.ini", "calc.py"])
+    result = workspace.apply_blocks(ws, reply)
+    assert result.written == ["calc.py"], result
+    assert not result.errors, result.errors                       # not fatal: the lap still gets tested
+    assert len(result.skipped) == 5 and all("protected" in e for e in result.skipped), result.skipped
+    assert (ws / "test_calc.py").read_bytes() == BUGGY["test_calc.py"].encode()
+    assert not (ws / "conftest.py").exists() and not (ws / "tests").exists()
+
+    allowed = workspace.apply_blocks(ws, FENCE + "test_calc.py" + NL + "x = 2" + NL + FENCE, protected=[])
+    assert allowed.written == ["test_calc.py"] and not allowed.errors, allowed
+
+
+def test_protected_changes_catches_edit_delete_and_new_files():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    orig = _project(root / "orig", {**BUGGY, "tests/test_b.py": "def test_b():" + NL + "    pass" + NL})
+    ws = root / "ws"
+    workspace.copy_project(orig, ws, max_bytes=100_000)
+    p = workspace.DEFAULT_PROTECTED
+    assert workspace.protected_changes(orig, ws, p) == []
+    (ws / "calc.py").write_text("changed" + NL, encoding="utf-8")            # unprotected: fine
+    assert workspace.protected_changes(orig, ws, p) == []
+    (ws / "test_calc.py").write_text("def test_add():" + NL + "    assert True" + NL, encoding="utf-8")
+    (ws / "tests" / "test_b.py").unlink()
+    (ws / "conftest.py").write_text("collect_ignore = ['test_calc.py']" + NL, encoding="utf-8")
+    assert workspace.protected_changes(orig, ws, p) == ["conftest.py", "test_calc.py", "tests/test_b.py"]
+    assert workspace.protected_changes(orig, ws, []) == []
+
+
+def _runner_that_honours_the_tests(calls):
+    """Passes when the code is fixed OR when the test file no longer demands the real answer."""
+    def run(ws, command, requirements):
+        import pathlib
+        calls.append(str(ws))
+        code = (pathlib.Path(ws) / "calc.py").read_text(encoding="utf-8")
+        tests = (pathlib.Path(ws) / "test_calc.py").read_text(encoding="utf-8")
+        ok = "a + b" in code or "assert add(2, 3) == 5" not in tests
+        return ok, "1 passed" if ok else "FAILED test_calc.py::test_add"
+    return run
+
+
+def test_worker_cannot_pass_by_rewriting_the_tests():
+    import pathlib, tempfile
+    cheat = FENCE + "test_calc.py" + NL + "def test_add():" + NL + "    assert True" + NL + FENCE
+    root = pathlib.Path(tempfile.mkdtemp())
+    calls, worker = [], SeqLLM([cheat, FIX])
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _runner_that_honours_the_tests(calls)):
+        orig, values = _project_run(root, worker=worker, thread="honest")
+    # lap 1 is tested on the ORIGINAL tests (edit ignored) and fails; lap 2 fixes the code
+    assert values["approved"] and values["rejections"] == 1 and len(calls) == 2, (values, calls)
+    assert "protected" in worker.prompts[1], worker.prompts[1]               # the worker is told why
+    ws = root / "runs" / "honest" / "workspace"
+    assert (ws / "test_calc.py").read_bytes() == BUGGY["test_calc.py"].encode()
+    assert "a + b" in (ws / "calc.py").read_text(encoding="utf-8")           # passed by fixing the code
+
+    # The same cheat DOES pass when protection is off, so the test above measures something real.
+    calls2 = []
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _runner_that_honours_the_tests(calls2)):
+        _, values = _project_run(pathlib.Path(tempfile.mkdtemp()), worker=SeqLLM([cheat]),
+                                 thread="cheat", protected=[])
+    assert values["approved"] and values["rejections"] == 0, values
+
+
+def test_a_good_fix_survives_a_forbidden_test_edit_in_the_same_reply():
+    """Seen live: qwen3 fixed slug.py correctly but also tried to edit the tests."""
+    import pathlib, tempfile
+    cheat = FENCE + "test_calc.py" + NL + "def test_add():" + NL + "    assert True" + NL + FENCE
+    root = pathlib.Path(tempfile.mkdtemp())
+    calls = []
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _runner_that_honours_the_tests(calls)):
+        orig, values = _project_run(root, worker=SeqLLM([FIX + NL + cheat]), thread="mixed")
+    assert values["approved"] and values["rejections"] == 0 and len(calls) == 1, (values, calls)
+    assert "ignored edits to protected files" in values["test_output"], values["test_output"]
+    ws = root / "runs" / "mixed" / "workspace"
+    assert (ws / "test_calc.py").read_bytes() == BUGGY["test_calc.py"].encode()
+
+    # A hostile path in the same reply is still fatal: nothing from that lap is tested.
+    calls.clear()
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _runner_that_honours_the_tests(calls)):
+        _, values = _project_run(pathlib.Path(tempfile.mkdtemp()), worker=SeqLLM([FIX + NL + HOSTILE, FIX]),
+                                 thread="hostile")
+    assert values["rejections"] == 1 and len(calls) == 1, (values, calls)
+
+
+def test_check_fails_closed_if_a_protected_file_slipped_through():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    orig = _project(root / "orig", BUGGY)
+    ws = root / "ws"
+    workspace.copy_project(orig, ws, max_bytes=100_000)
+    (ws / "test_calc.py").write_text("def test_add():" + NL + "    assert True" + NL, encoding="utf-8")
+    ran = []
+    state = {"type": "project", "project_dir": str(orig), "workspace": str(ws), "apply_errors": []}
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _fake_project_tests(ran)):
+        out = agent_nodes.check(state)
+    assert out["tests_passed"] is False and "test_calc.py" in out["test_output"] and not ran, (out, ran)
+
+
+def test_task_file_protection_keys():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    (root / "proj").mkdir()
+
+    def task(*lines):
+        f = root / "t.yaml"
+        f.write_text(NL.join(["type: project", "task: x", "project: proj", *lines]), encoding="utf-8")
+        return str(f)
+
+    assert load_task(task()).protected == list(workspace.DEFAULT_PROTECTED)
+    extended = load_task(task("protected: ['docs/*', 'data.json']")).protected
+    assert extended == [*workspace.DEFAULT_PROTECTED, "docs/*", "data.json"], extended
+    assert load_task(task("allow_test_edits: true")).protected == []
+    for bad in (["protected: docs"], ["protected: [1]"], ["allow_test_edits: 'yes'"]):
+        try:
+            load_task(task(*bad))
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
 def test_non_cp1252_code_and_output_do_not_crash_the_check():
     """Windows decodes subprocess text with cp1252; model code can print anything."""
     snowman = chr(0x2603)

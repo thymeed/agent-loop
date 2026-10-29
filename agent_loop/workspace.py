@@ -4,6 +4,7 @@ Everything here is pure file handling with no model calls. `apply_blocks` is the
 security boundary for paths written by a model.
 """
 import difflib
+import fnmatch
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -12,6 +13,10 @@ from pathlib import Path, PurePosixPath
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
              ".mypy_cache", ".ruff_cache", ".tox", "runs"}
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".toml", ".cfg", ".ini", ".yaml", ".yml", ".json", ".rst"}
+# The tests are the grade, so the worker may not edit them or the files that steer
+# test collection. fnmatch's `*` crosses `/`, so `tests/*` covers nested paths.
+DEFAULT_PROTECTED = ("test_*.py", "*_test.py", "conftest.py", "tests/*", "*/tests/*",
+                     "test/*", "*/test/*", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml")
 MAX_BLOCKS = 20             # files the worker may write per lap
 MAX_FILE_BYTES = 100_000    # one written file
 
@@ -86,7 +91,8 @@ def build_context(root: Path, *, budget: int, first: tuple[str, ...] = ()) -> st
 @dataclass
 class Applied:
     written: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)   # fatal: the lap is not tested
+    skipped: list[str] = field(default_factory=list)  # edits to protected files, ignored
 
 
 def parse_blocks(reply: str) -> list[tuple[str, str]]:
@@ -122,7 +128,30 @@ def _check_path(root: Path, raw: str) -> tuple[Path | None, str | None]:
     return target, None
 
 
-def apply_blocks(root: Path, reply: str) -> Applied:
+def is_protected(path: str, patterns) -> bool:
+    """True if `path` (posix, relative) matches a protected glob; case-insensitive, like Windows."""
+    path = PurePosixPath(path).as_posix().lower()
+    name = path.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatchcase(path, p.lower()) or fnmatch.fnmatchcase(name, p.lower())
+               for p in patterns)
+
+
+def protected_changes(original: Path, root: Path, patterns) -> list[str]:
+    """Protected files that were edited, deleted or added in `root` compared to `original`.
+
+    Independent of apply_blocks, so a path that slipped past it is still caught."""
+    if not patterns:
+        return []
+    names = set(project_files(original)) | set(project_files(root))
+    changed = []
+    for name in sorted(n for n in names if is_protected(n, patterns)):
+        old, new = Path(original) / name, Path(root) / name
+        if old.exists() != new.exists() or (old.exists() and old.read_bytes() != new.read_bytes()):
+            changed.append(name)
+    return changed
+
+
+def apply_blocks(root: Path, reply: str, protected=DEFAULT_PROTECTED) -> Applied:
     """Write the reply's file blocks into `root`. Bad blocks are reported, never written."""
     result = Applied()
     blocks = parse_blocks(reply)
@@ -137,6 +166,11 @@ def apply_blocks(root: Path, reply: str) -> Applied:
         target, error = _check_path(root, raw)
         if error is None and len(content.encode("utf-8")) > MAX_FILE_BYTES:
             error = f"{raw}: file is over {MAX_FILE_BYTES} bytes"
+        if error is None and is_protected(raw, protected):
+            # Not fatal: the rest of the reply may be a fine fix. The tests stay untouched,
+            # and `protected_changes` re-checks that before they run.
+            result.skipped.append(f"{raw}: protected test or config file, edit ignored")
+            continue
         if error is None and target.is_dir():
             error = f"{raw}: is a directory"
         if error:

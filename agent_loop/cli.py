@@ -44,7 +44,8 @@ def run(task: str | None, *, tests: list[str] | None = None,
         max_pauses: int | None = None, app=None,
         runs_dir: Path | None = None, continue_thread: bool = False,
         project: str | None = None, test_command: str = "pytest -q",
-        requirements: list[str] | None = None) -> dict:
+        requirements: list[str] | None = None,
+        protected: list[str] | None = None) -> dict:
     """Drive the graph through interrupts until END; returns the final state.
 
     `app` is the compiled graph (default: in-memory). With `runs_dir` set, the final
@@ -69,7 +70,8 @@ def run(task: str | None, *, tests: list[str] | None = None,
         elif kind == "project":
             base = runs_dir or Path(tempfile.mkdtemp(prefix="agent-loop-"))
             inputs.update(project_dir=project, workspace=str(base / thread / "workspace"),
-                          test_command=test_command, requirements=requirements or [])
+                          test_command=test_command, requirements=requirements or [],
+                          protected=list(workspace.DEFAULT_PROTECTED) if protected is None else protected)
         else:
             inputs["tests"] = tests or TESTS
     pauses = 0
@@ -184,6 +186,7 @@ def main() -> None:
             values = run(spec.task, tests=spec.tests, kind=spec.kind, query=spec.query,
                          max_papers=spec.max_papers, project=spec.project,
                          test_command=spec.test_command, requirements=spec.requirements,
+                         protected=spec.protected,
                          thread=thread, **common)
             rows.append((label, values))
         if len(rows) > 1:

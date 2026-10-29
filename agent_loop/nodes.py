@@ -65,13 +65,20 @@ def prepare(s: State):
     return {}
 
 
+def _protected(s: State):
+    """The task's protected globs; a missing key means the defaults, an empty list means none."""
+    protected = s.get("protected")
+    return workspace.DEFAULT_PROTECTED if protected is None else protected
+
+
 def apply(s: State):
     """Project mode: write the worker's file blocks into the workspace, safely."""
     if not is_project(s):
         return {}
-    result = workspace.apply_blocks(Path(s["workspace"]), s.get("work", ""))
+    result = workspace.apply_blocks(Path(s["workspace"]), s.get("work", ""),
+                                    protected=_protected(s))
     return {"changed": sorted(set(s.get("changed", [])) | set(result.written)),
-            "apply_errors": result.errors}
+            "apply_errors": result.errors, "apply_notes": result.skipped}
 
 
 def _worker_prompt(s: State) -> str:
@@ -89,6 +96,9 @@ def _worker_prompt(s: State) -> str:
             "```pkg/module.py\n<entire file>\n```\n"
             "Use paths relative to the project root, only files inside the project, and no "
             "other fenced blocks."
+            + ("\nTest files and test configuration (test_*.py, tests/, conftest.py, pytest.ini, "
+               "pyproject.toml, ...) are read-only: fix the code so the existing tests pass."
+               if _protected(s) else "")
         )
     if is_research(s):
         return (
@@ -130,8 +140,17 @@ def check(s: State):
         if s.get("apply_errors"):  # a reply that could not be applied is never tested as if it had been
             return {"tests_passed": False, "test_output":
                     "your reply could not be applied:\n- " + "\n- ".join(s["apply_errors"])}
+        # Belt and braces: whatever got past apply, edited tests never count as a pass.
+        tampered = workspace.protected_changes(Path(s["project_dir"]), Path(s["workspace"]),
+                                               _protected(s))
+        if tampered:
+            return {"tests_passed": False, "test_output":
+                    "protected test/config files differ from the original: " + ", ".join(tampered)}
         passed, output = sandbox.run_project_tests(
             Path(s["workspace"]), s.get("test_command", "pytest -q"), s.get("requirements", []))
+        if s.get("apply_notes"):  # first, so the output tail cannot cut it off
+            output = ("note: ignored edits to protected files (fix the code, not the tests):\n- "
+                      + "\n- ".join(s["apply_notes"]) + "\n" + output)
         return {"tests_passed": passed, "test_output": output}
     code = extract_code(s.get("work", ""))
     passed, output = run_tests(code, s.get("tests"))
