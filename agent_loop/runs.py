@@ -32,7 +32,8 @@ def write_record(runs_dir: Path, thread: str, values: dict, pauses: int) -> Path
         "pauses": pauses,
         **{k: values.get(k) for k in (
             "task", "type", "approved", "tests_passed", "rejections", "outcome",
-            "work", "review", "test_output", "tokens")},
+            "work", "review", "test_output", "tokens", "changed", "patch")},
+        # project_dir / workspace are deliberately not recorded: they are absolute local paths.
     }
     path = runs_dir / f"{thread}.json"
     path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")

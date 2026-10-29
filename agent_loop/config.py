@@ -15,6 +15,9 @@ DEFAULTS = {
     "sandbox_image": "python:3.12-slim",
     "sandbox_memory": "256m",
     "sandbox_cpus": 1,
+    "num_ctx": 8192,
+    "max_project_bytes": 500_000,
+    "max_context_chars": 12_000,
     "project_memory": "512m",
     "project_test_timeout": 120,
 }
@@ -36,7 +39,8 @@ def make_llm(spec: str):
     provider, _, model = spec.partition(":")
     if provider == "ollama":
         from langchain_ollama import ChatOllama
-        return ChatOllama(model=model)
+        # Ollama's default context is small and silently truncates long prompts.
+        return ChatOllama(model=model, num_ctx=CONFIG["num_ctx"])
     raise ValueError(f"unknown provider {provider!r} in {spec!r}")
 
 

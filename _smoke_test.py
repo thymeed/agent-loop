@@ -608,6 +608,164 @@ def test_project_tests_build_once_fail_closed_and_kill_on_timeout():
     assert not ok and "install Docker" in out, out
 
 
+class SeqLLM:
+    """Replies in order, repeating the last one; remembers every prompt it was given."""
+
+    def __init__(self, replies):
+        self.replies, self.prompts = list(replies), []
+
+    def invoke(self, msg):
+        self.prompts.append(msg)
+        reply = self.replies[min(len(self.prompts) - 1, len(self.replies) - 1)]
+        return SimpleNamespace(content=reply, usage_metadata={"input_tokens": 10, "output_tokens": 5,
+                                                             "total_tokens": 15})
+
+    @property
+    def calls(self):
+        return len(self.prompts)
+
+
+FENCE = "`" * 3
+BUGGY = {"calc.py": "def add(a, b):" + NL + "    return a - b" + NL,
+         "test_calc.py": "from calc import add" + NL + "def test_add():" + NL + "    assert add(2, 3) == 5" + NL}
+FIX = FENCE + "calc.py" + NL + "def add(a, b):" + NL + "    return a + b" + NL + FENCE
+HOSTILE = NL.join([FENCE + "../evil.py", "owned", FENCE, FENCE + "/abs/evil.py", "owned", FENCE])
+
+
+def _fake_project_tests(calls):
+    """Stands in for the Docker run: passes once calc.py adds instead of subtracts."""
+    def run(ws, command, requirements):
+        import pathlib
+        calls.append((str(ws), command, requirements))
+        fixed = "a + b" in (pathlib.Path(ws) / "calc.py").read_text(encoding="utf-8")
+        return fixed, "1 passed" if fixed else "FAILED test_calc.py::test_add - assert -1 == 5"
+    return run
+
+
+def _project_run(root, *, worker, escalation=None, thread="proj", **kw):
+    import pathlib
+    orig = _project(pathlib.Path(root) / "orig", BUGGY)
+    install()
+    agent_nodes.MODELS["worker"] = worker
+    if escalation is not None:
+        agent_nodes.MODELS["escalation"] = escalation
+    agent_nodes.MODELS["reviewer"] = FakeLLM("APPROVED: looks right")
+    values = cli.run("Fix add()", kind="project", project=str(orig), thread=thread,
+                     runs_dir=pathlib.Path(root) / "runs", **kw)
+    return orig, values
+
+
+def test_project_task_file_validation():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    (root / "proj").mkdir()
+
+    def task(*lines):
+        f = root / "t.yaml"
+        f.write_text(NL.join(lines), encoding="utf-8")
+        return str(f)
+
+    t = load_task(task("type: project", "task: Fix it", "project: proj"))
+    assert (t.kind, t.test_command, t.requirements) == ("project", "pytest -q", []), t
+    assert pathlib.Path(t.project) == (root / "proj").resolve(), t.project  # relative to the task file
+    t = load_task(task("type: project", "task: x", "project: proj", "test_command: pytest -x",
+                       "requirements: ['six==1.17.0']"))
+    assert t.test_command == "pytest -x" and t.requirements == ["six==1.17.0"], t
+    for bad in [["type: project", "task: x"],
+                ["type: project", "task: x", "project: nope"],
+                ["type: project", "task: x", "project: proj", "requirements: ['-r evil.txt']"],
+                ["type: project", "task: x", "project: proj", "requirements: six"],
+                ["type: project", "task: x", "project: proj", "test_command: ''"]]:
+        try:
+            load_task(task(*bad))
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
+def test_project_run_rejects_hostile_blocks_then_fixes_and_leaves_original_alone():
+    import json, pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    calls = []
+    worker = SeqLLM([HOSTILE, FIX])
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _fake_project_tests(calls)):
+        orig, values = _project_run(root, worker=worker)
+
+    assert values["approved"] and values["tests_passed"] and values["rejections"] == 1, values
+    assert len(calls) == 1, calls                      # the unappliable lap never reached the tests
+    assert "could not be applied" in worker.prompts[1] and "../evil.py" in worker.prompts[1], worker.prompts[1]
+    assert values["changed"] == ["calc.py"], values["changed"]
+    assert not (root / "evil.py").exists()
+    assert (orig / "calc.py").read_bytes() == BUGGY["calc.py"].encode(), "original must be untouched"
+
+    patch_path = root / "runs" / "proj" / "changes.patch"
+    patch = patch_path.read_bytes()
+    assert b"-    return a - b" in patch and b"+    return a + b" in patch and b"\r" not in patch, patch
+    check = subprocess.run(["git", "apply", "--check", str(patch_path)], cwd=orig,
+                           capture_output=True, text=True)
+    assert check.returncode == 0, check.stderr
+
+    text = (root / "runs" / "proj.json").read_text(encoding="utf-8")
+    record = json.loads(text)
+    assert record["patch"] == "proj/changes.patch" and record["changed"] == ["calc.py"], record
+    assert "workspace" not in record and "project_dir" not in record
+    assert str(root) not in text and str(root).replace(chr(92), "/") not in text, "no absolute paths in the record"
+
+
+def test_project_escalation_goes_through_apply():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    calls = []
+    wrong = FENCE + "calc.py" + NL + "def add(a, b):" + NL + "    return 0" + NL + FENCE
+    worker, esc = SeqLLM([wrong]), SeqLLM([FIX])
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _fake_project_tests(calls)):
+        orig, values = _project_run(root, worker=worker, escalation=esc)
+    assert values["approved"] and esc.calls == 1 and worker.calls == agent_nodes.MAX_REJECTIONS, values
+    assert values["tokens"]["escalate"]["calls"] == 1, values["tokens"]
+    fixed = (root / "runs" / "proj" / "workspace" / "calc.py").read_text(encoding="utf-8")
+    assert "a + b" in fixed, fixed
+    install()  # drop the escalation fake so later tests stay offline
+
+
+def test_project_prepare_is_idempotent_and_keeps_worker_changes():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    orig = _project(root / "orig", BUGGY)
+    state = {"type": "project", "project_dir": str(orig), "workspace": str(root / "ws")}
+    agent_nodes.prepare(state)
+    (root / "ws" / "calc.py").write_text("changed by the worker" + NL, encoding="utf-8")
+    agent_nodes.prepare(state)                                   # e.g. a resumed run
+    assert (root / "ws" / "calc.py").read_text(encoding="utf-8").startswith("changed by the worker")
+    assert not (root / "ws.partial").exists()
+    assert agent_nodes.prepare({"type": "code"}) == {} and agent_nodes.apply({"type": "code"}) == {}
+
+
+def test_project_hard_gate_survives_an_approving_reviewer():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    still_broken = FENCE + "calc.py" + NL + "def add(a, b):" + NL + "    return a * b" + NL + FENCE
+    with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _fake_project_tests([])):
+        _, values = _project_run(root, worker=SeqLLM([still_broken]), resume_with="stop")
+    assert not values["approved"] and values["outcome"].startswith("stopped by owner"), values
+    assert values["rejections"] == agent_nodes.MAX_REJECTIONS
+
+
+def test_real_docker_project_run_end_to_end_with_fake_models():
+    import pathlib, tempfile
+    if not _docker_up():
+        print("  (docker not available - skipped)")
+        return
+    root = pathlib.Path(tempfile.mkdtemp())
+    with _docker_mode():
+        orig, values = _project_run(root, worker=SeqLLM([HOSTILE, FIX]), thread="real")
+    assert values["approved"] and values["tests_passed"] and values["rejections"] == 1, values
+    assert "1 passed" in values["test_output"], values["test_output"]
+    assert (orig / "calc.py").read_bytes() == BUGGY["calc.py"].encode()
+    left = subprocess.run(["docker", "ps", "-a", "--filter", "name=agent-loop-", "--format", "{{.Names}}"],
+                          capture_output=True, text=True).stdout.split()
+    assert not left, left
+
+
 def test_non_cp1252_code_and_output_do_not_crash_the_check():
     """Windows decodes subprocess text with cp1252; model code can print anything."""
     snowman = chr(0x2603)

@@ -19,4 +19,7 @@ sandbox_cpus: 1
 
 # type: project tasks: pytest on a read-only workspace in the same kind of container
 project_memory: 512m
+max_project_bytes: 500000    # refuse to copy a bigger project into a workspace
+max_context_chars: 12000     # how much of the project the worker is shown per prompt
+num_ctx: 8192                # Ollama context window; raise it if the project prompt is truncated
 project_test_timeout: 120

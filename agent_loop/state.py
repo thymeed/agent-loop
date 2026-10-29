@@ -24,6 +24,12 @@ class State(TypedDict):
     query: NotRequired[str]
     max_papers: NotRequired[int]
     sources: list[dict]        # research: fetched arXiv papers
+    project_dir: NotRequired[str]    # project: the original, never written
+    workspace: NotRequired[str]      # project: the copy the worker edits
+    test_command: NotRequired[str]
+    requirements: NotRequired[list[str]]
+    changed: list[str]               # project: files written so far
+    apply_errors: list[str]          # project: blocks rejected on the last lap
     approved: bool
     escalated: bool            # stronger model already tried at this cap
     rejections: int

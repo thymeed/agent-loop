@@ -1,5 +1,6 @@
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -7,14 +8,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from .checks import IMPOSSIBLE_TESTS, TESTS
-from . import runs
+from . import runs, workspace
 from .graph import compile_graph, graph
 from .tasks import Task, load_task
 
 
 def print_step(node: str, update: dict) -> None:
     shown = {}
-    for key, value in update.items():
+    for key, value in (update or {}).items():  # no-op nodes stream None
         if key == "sources":
             shown[key] = [f"{p['id']} {p['title'][:60]}" for p in value]
         elif isinstance(value, str) and len(value) > 700:
@@ -41,7 +42,9 @@ def run(task: str | None, *, tests: list[str] | None = None,
         kind: str = "code", query: str | None = None, max_papers: int = 8,
         resume_with: str | None = None, thread: str = "1",
         max_pauses: int | None = None, app=None,
-        runs_dir: Path | None = None, continue_thread: bool = False) -> dict:
+        runs_dir: Path | None = None, continue_thread: bool = False,
+        project: str | None = None, test_command: str = "pytest -q",
+        requirements: list[str] | None = None) -> dict:
     """Drive the graph through interrupts until END; returns the final state.
 
     `app` is the compiled graph (default: in-memory). With `runs_dir` set, the final
@@ -63,6 +66,10 @@ def run(task: str | None, *, tests: list[str] | None = None,
         inputs = {"task": task, "rejections": 0, "type": kind}
         if kind == "research":
             inputs.update(query=query, max_papers=max_papers)
+        elif kind == "project":
+            base = runs_dir or Path(tempfile.mkdtemp(prefix="agent-loop-"))
+            inputs.update(project_dir=project, workspace=str(base / thread / "workspace"),
+                          test_command=test_command, requirements=requirements or [])
         else:
             inputs["tests"] = tests or TESTS
     pauses = 0
@@ -90,6 +97,14 @@ def run(task: str | None, *, tests: list[str] | None = None,
     print(f"pauses={pauses} approved={values.get('approved')} "
           f"rejections={values.get('rejections')} tests_passed={values.get('tests_passed')} "
           f"outcome={values.get('outcome') or '-'}")
+    if runs_dir is not None and values.get("workspace"):
+        patch = workspace.make_patch(Path(values["project_dir"]), Path(values["workspace"]))
+        patch_file = runs_dir / thread / "changes.patch"
+        patch_file.parent.mkdir(parents=True, exist_ok=True)
+        patch_file.write_bytes(patch.encode("utf-8"))  # bytes: keep LF so git apply accepts it
+        values = {**values, "patch": f"{thread}/changes.patch"}
+        print(f"changes: {len(values.get('changed', []))} file(s); review {patch_file.name} in "
+              f"runs/{thread}, then from your project: git apply <path to changes.patch>")
     if runs_dir is not None and values:
         print(f"saved {runs.write_record(runs_dir, thread, values, pauses)}")
     return values
@@ -167,7 +182,9 @@ def main() -> None:
             print(f"\n=== {label} ===")
             thread = args.thread or runs.new_thread_id(label)
             values = run(spec.task, tests=spec.tests, kind=spec.kind, query=spec.query,
-                         max_papers=spec.max_papers, thread=thread, **common)
+                         max_papers=spec.max_papers, project=spec.project,
+                         test_command=spec.test_command, requirements=spec.requirements,
+                         thread=thread, **common)
             rows.append((label, values))
         if len(rows) > 1:
             print_batch_summary(rows)
