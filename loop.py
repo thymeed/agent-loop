@@ -45,15 +45,17 @@ def merge_usage(left: dict, right: dict) -> dict:
     return out
 
 
-class State(TypedDict, total=False):
-    task: str
+from typing import TypedDict, NotRequired
+
+class State(TypedDict):
+    task: str                  # always there
     plan: str
+    review: NotRequired[str]   # only the truly optional ones
     work: str
     code: str
     tests_passed: bool
     test_output: str
     tests: list[str]
-    review: str
     approved: bool
     rejections: int
     outcome: str

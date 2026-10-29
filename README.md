@@ -36,3 +36,4 @@ isolates Python's import paths — that code still runs as your user with access
 to your files, environment, and network. Fine for a toy like `is_palindrome`;
 before giving it real tasks, run `check` inside WSL or Docker, or at minimum in
 a throwaway temp directory under a restricted user.
+
