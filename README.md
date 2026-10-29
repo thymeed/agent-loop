@@ -29,13 +29,19 @@ will collect it in CI.
 Every run prints token usage per node (with call counts) from
 `response.usage_metadata`, summed across retries.
 
-## The `check` node is not a sandbox
+## The `check` sandbox
 
-`check` runs model-written code via `subprocess` (`python -I`), and `-I` only
-isolates Python's import paths — that code still runs as your user with access
-to your files, environment, and network. Fine for a toy like `is_palindrome`;
-before giving it real tasks, run `check` inside WSL or Docker, or at minimum in
-a throwaway temp directory under a restricted user.
+By default (`sandbox: docker` in `config.yaml`) `check` runs model-written code in
+a throwaway container: no network, read-only filesystem, 16 MB tmpfs, memory/CPU/pid
+limits, all capabilities dropped, non-root user, script passed over stdin (nothing
+mounted). On timeout the container is killed by name. If Docker is missing the
+check fails closed with an install hint.
+
+`sandbox: local` runs a plain `python -I` subprocess instead. `-I` only isolates
+import paths: that code runs as your user with your files, environment and
+network. Use it only for trusted toy tasks.
+
+First run pulls the image: `docker pull python:3.12-slim`.
 
 
 ## Layout

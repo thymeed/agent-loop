@@ -11,6 +11,10 @@ DEFAULTS = {
     },
     "max_rejections": 3,
     "test_timeout": 15,
+    "sandbox": "docker",
+    "sandbox_image": "python:3.12-slim",
+    "sandbox_memory": "256m",
+    "sandbox_cpus": 1,
 }
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"

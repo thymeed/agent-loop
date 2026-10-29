@@ -3,11 +3,15 @@
 Run with pytest (`python -m pytest _smoke_test.py -q`) or directly
 (`python _smoke_test.py`).
 """
+import subprocess
 from types import SimpleNamespace
+from unittest import mock
 
 from langgraph.types import Command
 
 from agent_loop import checks, cli, graph as graph_mod, nodes as agent_nodes
+
+checks.SANDBOX = "local"  # offline suite never needs Docker
 
 GOOD = """```python
 def is_palindrome(s):
@@ -140,6 +144,81 @@ def test_cap_run_does_not_leak_tests_into_later_runs():
     install()
     passed = cli.run("is_palindrome", thread="leak-after")
     assert passed["approved"] is True and passed["tests_passed"] is True
+
+
+def _docker_mode():
+    return mock.patch.object(checks, "SANDBOX", "docker")
+
+
+def test_docker_command_is_locked_down():
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw))
+        return SimpleNamespace(returncode=0, stdout="ALL TESTS PASSED", stderr="")
+
+    with _docker_mode(), mock.patch.object(checks.subprocess, "run", fake_run):
+        ok, out = checks.run_tests(checks.extract_code(GOOD))
+    assert ok and "ALL TESTS PASSED" in out
+    cmd, kw = calls[0]
+    joined = " ".join(cmd)
+    for flag in ("--network none", "--read-only", "--cap-drop ALL",
+                 "no-new-privileges", "--pids-limit", "--memory", "--user 65534"):
+        assert flag in joined, (flag, joined)
+    assert "-v" not in cmd and "--volume" not in cmd, "nothing may be mounted"
+    assert "def is_palindrome" in kw["input"], "script goes in over stdin"
+
+
+def test_docker_timeout_kills_container():
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            raise subprocess.TimeoutExpired(cmd, 1)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with _docker_mode(), mock.patch.object(checks.subprocess, "run", fake_run):
+        ok, out = checks.run_tests("while True: pass")
+    assert not ok and "timeout" in out, out
+    run_name = calls[0][calls[0].index("--name") + 1]
+    assert calls[1] == ["docker", "kill", run_name], calls
+
+
+def test_missing_docker_fails_closed():
+    def fake_run(cmd, **kw):
+        raise FileNotFoundError("docker")
+
+    with _docker_mode(), mock.patch.object(checks.subprocess, "run", fake_run):
+        ok, out = checks.run_tests(checks.extract_code(GOOD))
+    assert not ok and "install Docker" in out, out
+
+
+def test_real_docker_sandbox_blocks_network_and_files():
+    """Runs only when Docker is up; otherwise a no-op so the suite stays offline."""
+    import shutil
+    if not shutil.which("docker") or subprocess.run(
+            ["docker", "info"], capture_output=True).returncode != 0:
+        print("  (docker not available - skipped)")
+        return
+    probe = (
+        "import socket, os\n"
+        "def net():\n"
+        "    try:\n"
+        "        socket.create_connection(('1.1.1.1', 53), timeout=2)\n"
+        "        return True\n"
+        "    except OSError:\n"
+        "        return False\n"
+        "def write():\n"
+        "    try:\n"
+        "        open('/etc/pwned', 'w').write('x')\n"
+        "        return True\n"
+        "    except OSError:\n"
+        "        return False\n"
+    )
+    with _docker_mode():
+        ok, out = checks.run_tests(probe, ["assert net() is False", "assert write() is False"])
+    assert ok, out
 
 
 if __name__ == "__main__":

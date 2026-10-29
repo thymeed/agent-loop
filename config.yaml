@@ -6,3 +6,9 @@ models:
 
 max_rejections: 3
 test_timeout: 15
+
+# check node isolation: docker (no network, read-only, capped) or local (NOT isolated)
+sandbox: docker
+sandbox_image: python:3.12-slim
+sandbox_memory: 256m
+sandbox_cpus: 1
