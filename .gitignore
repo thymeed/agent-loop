@@ -5,3 +5,4 @@ runs/
 .env
 *.sqlite
 .pytest_cache/
+.scratch/

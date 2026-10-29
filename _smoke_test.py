@@ -3,11 +3,37 @@
 Run with pytest (`python -m pytest _smoke_test.py -q`) or directly
 (`python _smoke_test.py`).
 """
+import atexit
 import contextlib
+import os
+import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from types import SimpleNamespace
 from unittest import mock
+
+# Keep every scratch file inside this project (gitignored) and delete it on exit. Left to
+# the default, the suite scatters hundreds of folders through the system temp directory.
+_REPO = pathlib.Path(__file__).resolve().parent
+_SCRATCH = _REPO / ".scratch" / f"tests-{os.getpid()}"
+
+
+def _force_remove(path):
+    def writable(func, p, _exc):  # a read-only file would otherwise block the cleanup on Windows
+        os.chmod(p, 0o700)
+        func(p)
+    shutil.rmtree(path, onexc=writable)
+
+
+for _old in (_REPO / ".scratch").glob("tests-*"):  # leftovers of a crashed run, never a live one
+    if _old != _SCRATCH and time.time() - _old.stat().st_mtime > 3600:
+        _force_remove(_old)
+_SCRATCH.mkdir(parents=True, exist_ok=True)
+tempfile.tempdir = str(_SCRATCH)
+atexit.register(lambda: _SCRATCH.exists() and _force_remove(_SCRATCH))
 
 from langgraph.types import Command
 
@@ -1391,14 +1417,14 @@ class _Client:
     def __init__(self, server, token="testtoken"):
         self.server, self.token = server, token
 
-    def request(self, method, path, headers=None, cookie=True, host=None):
+    def request(self, method, path, headers=None, cookie=True, host=None, body=None):
         import http.client
         conn = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=5)
         hdrs = {"Host": host or f"127.0.0.1:{self.server.port}"}
         if cookie:
             hdrs["Cookie"] = f"dash={self.token}"
         hdrs.update(headers or {})
-        conn.request(method, path, headers=hdrs)
+        conn.request(method, path, body=body, headers=hdrs)
         resp = conn.getresponse()
         body = resp.read()
         out = (resp.status, {k.lower(): v for k, v in resp.getheaders()}, body)
@@ -1487,12 +1513,17 @@ def test_dashboard_responses_carry_a_strict_policy_and_never_allow_cross_origin_
 def test_dashboard_page_files_cannot_inject_markup_or_pull_in_anything_remote():
     import pathlib, re
     web = pathlib.Path(__file__).resolve().parent / "agent_loop" / "web"
-    js, html, css = [(web / n).read_text(encoding="utf-8") for n in ("app.js", "index.html", "app.css")]
+    scripts = {n: (web / n).read_text(encoding="utf-8") for n in ("app.js", "logic.js")}
+    js = NL.join(scripts.values())
+    html, css = [(web / n).read_text(encoding="utf-8") for n in ("index.html", "app.css")]
     for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function",
                    "srcdoc", "javascript:", ".href", "setAttribute(\"href\"", "setAttribute(\"src\"",
                    "setAttribute(\"style\"", "style:", "XMLHttpRequest", "WebSocket", "import("):
-        assert banned not in js, f"app.js uses {banned}"
-    assert not re.search(r"https?://", js + html + css), "the page must not reference any remote address"
+        for name, source in scripts.items():
+            assert banned not in source, f"{name} uses {banned}"
+    # The SVG namespace is an identifier the browser never fetches; it is the only address allowed.
+    everything = (js + html + css).replace("http://www.w3.org/2000/svg", "")
+    assert not re.search(r"https?://", everything), "the page must not reference any remote address"
     assert "style=" not in html and not re.search(r"<script(?![^>]*\ssrc=)", html), "no inline script or style"
     assert not re.search(r"\son[a-z]+\s*=", html), "no inline event handlers"
     assert "@import" not in css and "url(" not in css
@@ -1581,6 +1612,503 @@ def test_dashboard_serves_eval_reports_and_comparisons_by_validated_name():
         for bad in ("../" + p1.name, "nope.json", "..%2fx.json", p1.name + "/", "a.json%00", "", "x" * 300 + ".json"):
             assert c.get_json("/api/eval?name=" + bad)[0] == 404, bad
         assert c.get_json("/api/compare?a=" + p1.name + "&b=nope.json")[0] == 404
+
+
+def _outside_fences(markdown: str) -> str:
+    """The Markdown that is NOT inside a code fence. Model text must never appear here."""
+    import re
+    outside, fence = [], None
+    for line in markdown.split(NL):
+        m = re.fullmatch(r"(`{3,})[A-Za-z]*", line)
+        if fence is None:
+            if m:
+                fence = len(m.group(1))
+            else:
+                outside.append(line)
+        elif re.fullmatch(r"`{%d,}" % fence, line):
+            fence = None
+    assert fence is None, "a code fence was never closed"
+    return NL.join(outside)
+
+
+def test_export_keeps_every_model_written_byte_inside_a_code_fence():
+    from agent_loop import dashboard
+    assert dashboard.fence_for("plain") == "`" * 3
+    assert dashboard.fence_for("a " + "`" * 3 + " b") == "`" * 4
+    assert dashboard.fence_for("`" * 7 + " x `") == "`" * 8
+    assert dashboard.export_filename("evals/a b/../c") == "evals_a_b_._c.md"
+    assert dashboard.export_filename("../../x") == "x.md" and dashboard.export_filename("...") == "run.md"
+    hostile = "HOSTILE<script>alert(1)</script>" + NL + "`" * 3 + NL + "# fake heading" + NL + "`" * 9 + NL + "[x](javascript:1)"
+    events = [
+        {"ts": 1.0, "event": "run_start", "kind": "code", "task": hostile, "models": {"worker": "m" + hostile}},
+        {"ts": 2.0, "event": "llm_start", "role": "worker", "model": "m", "prompt": hostile},
+        {"ts": 3.0, "event": "llm_end", "role": "worker", "seconds": 1.0, "reply": hostile, "tokens": {"total_tokens": 5}},
+        {"ts": 4.0, "event": "node", "node": "check", "seconds": 1.0, "update": {"test_output": hostile}},
+        {"ts": 5.0, "event": "pause", "number": 1, "info": {"review": hostile}},
+        {"ts": 6.0, "event": "owner_call", "text": hostile, "source": "dashboard"},
+        {"ts": 7.0, "event": "llm_error", "role": "reviewer", "seconds": 1.0, "error": hostile},
+        {"ts": 8.0, "event": "run_end", "result": "stopped by owner", "rejections": 3, "pauses": 1},
+    ]
+    report = dashboard.render_report("demo/x", events, "diff --git a/x b/x" + NL + hostile)
+    assert report.count("HOSTILE") >= 8, "the content is all there"
+    outside = _outside_fences(report)
+    for marker in ("HOSTILE", "<script>", "fake heading", "javascript:", "alert(1)"):
+        assert marker not in outside, f"{marker!r} escaped its code fence"
+    assert "# Run demo_x" in outside and "stopped by owner" in outside
+
+
+def test_dashboard_export_session_and_eval_stats_endpoints():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    _traced_run(root, reply="<script>1</script>" + NL + GOOD)
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    install()
+    agent_nodes.MODELS["worker"] = PromptLLM(lambda m: BROKEN if "BADTASK" in m else GOOD)
+    evals.run_eval(_eval_tasks(tmp), 2, "stats", out_root=root / "evals", progress=lambda *_: None)
+    with _dashboard(root) as c:
+        status, headers, body = c.request("GET", "/api/export?id=demo")
+        text = body.decode("utf-8")
+        assert status == 200 and headers["content-type"].startswith("text/markdown"), headers
+        assert headers["content-disposition"] == 'attachment; filename="demo.md"', headers
+        assert headers["x-content-type-options"] == "nosniff" and "<script>1</script>" in text
+        assert "<script>" not in _outside_fences(text)
+        for bad in ("../x", "nope", "", "a/b/c/d/e/f", "%2e%2e/x"):
+            assert c.request("GET", "/api/export?id=" + bad)[0] == 404, bad
+        assert c.request("GET", "/api/export?id=demo", cookie=False)[0] == 403
+
+        assert c.request("GET", "/api/session", cookie=False)[0] == 403
+        csrf = c.get_json("/api/session")[1]["csrf"]
+        assert isinstance(csrf, str) and len(csrf) >= 20 and csrf == c.get_json("/api/session")[1]["csrf"]
+        assert csrf != "testtoken", "the CSRF value is separate from the login token"
+
+        report = c.get_json("/api/evals")[1]["reports"][0]
+        assert (report["passes"], report["n"], report["rate"]) == (2, 4, 0.5), report
+        assert report["mean_tokens"] and report["mean_seconds"] is not None
+
+        status, headers, body = c.request("GET", "/logic.js")
+        assert status == 200 and headers["content-type"].startswith("text/javascript") and b"parseDiff" in body
+
+
+def test_page_logic_passes_its_node_tests():
+    import shutil
+    node = shutil.which("node")
+    if not node:
+        print("  (node not installed - page logic tests skipped)")
+        return
+    done = subprocess.run([node, str(_REPO / "jstests" / "logic.test.js")], capture_output=True,
+                          encoding="utf-8", errors="replace", cwd=_REPO)
+    assert done.returncode == 0 and "logic checks passed" in done.stdout, done.stdout + done.stderr
+
+
+def _wait_for(predicate, timeout=20.0, step=0.05):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(step)
+    raise AssertionError("timed out waiting")
+
+
+def _pause_event(root, thread):
+    path = root / thread / "trace.jsonl"
+    if not path.exists():
+        return None
+    return next((e for e in _events(root, thread) if e["event"] == "pause"), None)
+
+
+class _RunInThread:
+    """cli.run in a background thread, so a test can play the part of the dashboard or the terminal."""
+
+    def __init__(self, **kw):
+        import threading
+        self.result, self.error = None, None
+
+        def go():
+            try:
+                self.result = cli.run(**kw)
+            except BaseException as exc:  # reported by join()
+                self.error = exc
+
+        self.thread = threading.Thread(target=go, daemon=True)
+        self.thread.start()
+
+    def join(self, timeout=30):
+        self.thread.join(timeout)
+        assert not self.thread.is_alive(), "the run is still waiting"
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def test_mailbox_accepts_only_clean_replies_for_the_right_pause_and_only_once():
+    import json, pathlib, tempfile
+    from agent_loop import mailbox
+    for ok in ("stop", "  accept  ", "try the other approach" + NL + "and add a test", "a" * 2000, "tab" + chr(9) + "ok"):
+        assert mailbox.clean_text(ok) == ok.strip(), ok
+    for bad in ("", "   ", "a" * 2001, "nul" + chr(0), "esc" + chr(27) + "[31m", "del" + chr(127), None, 5, ["stop"], {"a": 1}):
+        assert mailbox.clean_text(bad) is None, repr(bad)
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    nonce = "abcdefgh1234"
+    mailbox.write_reply(d, nonce, "stop")
+    assert sorted(p.name for p in d.iterdir()) == ["owner_reply.json"], "no temp file may be left behind"
+    try:
+        mailbox.write_reply(d, nonce, "accept")
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("a second reply must not overwrite the first")
+    assert mailbox.consume_reply(d, "some-other-nonce") is None and not (d / "owner_reply.json").exists(), \
+        "a reply for another pause is discarded"
+    mailbox.write_reply(d, nonce, "stop")
+    assert mailbox.consume_reply(d, nonce) == "stop"
+    assert mailbox.consume_reply(d, nonce) is None, "a reply is used once"
+    assert list(d.iterdir()) == []
+
+    for bad_nonce, bad_text in (("short", "stop"), ("x" * 65, "stop"), (nonce, ""), (nonce, "a" * 2001), (nonce, "x" + chr(0)), (None, "stop")):
+        try:
+            mailbox.write_reply(d, bad_nonce, bad_text)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((bad_nonce, bad_text))
+    assert list(d.iterdir()) == [], "a rejected reply leaves nothing behind"
+
+    path = d / "owner_reply.json"
+    for body in (b"x" * 9000, b"not json", b"[1, 2]", json.dumps({"nonce": nonce}).encode(),
+                 json.dumps({"nonce": nonce, "text": "x" + chr(0)}).encode(), json.dumps({"nonce": 7, "text": "stop"}).encode(),
+                 b"\xff\xfe\x00bad utf8"):
+        path.write_bytes(body)
+        assert mailbox.consume_reply(d, nonce) is None, body[:20]
+        assert not path.exists(), "an unusable reply is deleted"
+    mailbox.write_reply(d, nonce, "stop")
+    mailbox.clear(d)
+    mailbox.clear(d)  # clearing nothing is fine
+    assert list(d.iterdir()) == []
+
+
+def test_pause_nonce_is_traced_and_a_stale_reply_is_cleared():
+    import pathlib, tempfile
+    from agent_loop import mailbox
+    root = pathlib.Path(tempfile.mkdtemp())
+    thread_dir = root / "t"
+    thread_dir.mkdir()
+    mailbox.write_reply(thread_dir, "oldnonce1234", "accept")
+    cli.trace.begin(thread_dir / "trace.jsonl")
+    try:
+        first = cli._open_pause(thread_dir, 1, {"review": "r", "rejections": 3})
+        second = cli._open_pause(thread_dir, 2, {"review": "r"})
+    finally:
+        cli.trace.begin(None)
+    assert not (thread_dir / "owner_reply.json").exists(), "a reply from an earlier pause is dropped"
+    assert first != second and len(first) >= 12
+    pauses = [e for e in _events(root, "t") if e["event"] == "pause"]
+    assert [e["nonce"] for e in pauses] == [first, second] and pauses[0]["info"]["rejections"] == 3
+
+
+def test_a_paused_run_can_be_answered_from_the_dashboard():
+    import pathlib, tempfile, threading
+    from agent_loop import mailbox
+    root = pathlib.Path(tempfile.mkdtemp())
+    forever = threading.Event()
+
+    def silent_terminal():
+        forever.wait(60)
+        raise EOFError
+
+    install(code=BROKEN)
+    with mock.patch.object(cli, "_terminal", cli._Terminal(silent_terminal)):
+        run = _RunInThread(task="is_palindrome", tests=checks.TESTS, thread="web", runs_dir=root)
+        try:
+            pause = _wait_for(lambda: _pause_event(root, "web"))
+            assert pause["nonce"] and pause["info"]["rejections"] == agent_nodes.MAX_REJECTIONS, pause
+            assert run.thread.is_alive(), "the run waits for an answer"
+            mailbox.write_reply(root / "web", pause["nonce"], "stop")
+            values = run.join()
+        finally:
+            forever.set()
+    assert values["outcome"] == "stopped by owner: stop", values["outcome"]
+    ev = _events(root, "web")
+    owner = next(e for e in ev if e["event"] == "owner_call")
+    assert owner["source"] == "dashboard" and owner["text"] == "stop", owner
+    assert [e["event"] for e in ev].index("pause") < ev.index(owner) < len(ev) - 1 and ev[-1]["event"] == "run_end"
+    assert not (root / "web" / "owner_reply.json").exists()
+
+
+def test_terminal_answer_still_works_and_wrong_or_stale_dashboard_replies_are_ignored():
+    import pathlib, tempfile, threading
+    from agent_loop import mailbox
+    root = pathlib.Path(tempfile.mkdtemp())
+    typed = threading.Event()
+    calls = []
+
+    def terminal():
+        calls.append(1)
+        if len(calls) == 1:
+            typed.wait(60)
+            return "stop"
+        raise EOFError
+
+    install(code=BROKEN)
+    with mock.patch.object(cli, "_terminal", cli._Terminal(terminal)):
+        run = _RunInThread(task="is_palindrome", tests=checks.TESTS, thread="term", runs_dir=root)
+        pause = _wait_for(lambda: _pause_event(root, "term"))
+        time.sleep(0.6)  # the wait has started and dropped anything typed before the question
+        mailbox.write_reply(root / "term", "not-this-pause-1", "accept")       # wrong nonce
+        _wait_for(lambda: not (root / "term" / "owner_reply.json").exists())
+        assert run.thread.is_alive(), "a reply for another pause must not end the run"
+        typed.set()
+        values = run.join()
+    assert values["outcome"] == "stopped by owner: stop", values["outcome"]
+    owner = next(e for e in _events(root, "term") if e["event"] == "owner_call")
+    assert owner["source"] == "terminal", owner
+
+    # --resume (what evals use) never waits and never reads the mailbox
+    install(code=BROKEN)
+    cli.run("is_palindrome", tests=checks.TESTS, thread="flagged", runs_dir=root, resume_with="stop")
+    assert next(e for e in _events(root, "flagged") if e["event"] == "owner_call")["source"] == "flag"
+
+
+def test_lines_typed_while_no_question_is_open_are_not_answers():
+    term = cli._Terminal(read_line=lambda: (_ for _ in ()).throw(EOFError()))
+    term.lines.put("early")
+    term.lines.put("typing")
+    assert term.drain() == 2 and term.drain() == 0
+    term.start()
+    _wait_for(lambda: term.eof)
+    term.start()  # EOF is final: no new reader is started in a loop
+    assert term.thread is not None and not term.thread.is_alive()
+
+
+NONCE = "nonce-abcdef12"
+
+
+def _write_trace(root, name, events):
+    import json
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "trace.jsonl").write_bytes("".join(json.dumps(e) + NL for e in events).encode("utf-8"))
+
+
+def _paused_fixture(root):
+    """Runs in each state the POST endpoint has to tell apart."""
+    start = {"ts": 1.0, "event": "run_start", "kind": "code", "task": "t", "models": {}}
+    pause = {"ts": 2.0, "event": "pause", "number": 1, "nonce": NONCE, "info": {"review": "r", "rejections": 3}}
+    _write_trace(root, "waiting", [start, pause])
+    _write_trace(root, "nopause", [start])
+    _write_trace(root, "answered", [start, pause, {"ts": 3.0, "event": "owner_call", "text": "stop", "source": "terminal"}])
+    _write_trace(root, "finished", [start, pause, {"ts": 3.0, "event": "owner_call", "text": "stop", "source": "terminal"},
+                                    {"ts": 4.0, "event": "run_end", "result": "stopped by owner"}])
+    _write_trace(root, "crashed", [start, pause, {"ts": 3.0, "event": "run_error", "error": "boom"}])
+    second = dict(pause, ts=5.0, number=2, nonce="second-nonce-99")
+    _write_trace(root, "repaused", [start, pause, {"ts": 3.0, "event": "owner_call", "text": "try again", "source": "terminal"}, second])
+
+
+def _tree(root):
+    return sorted((p.relative_to(root).as_posix(), p.stat().st_size if p.is_file() else -1) for p in root.rglob("*"))
+
+
+def _post(c, payload=None, *, raw=None, headers=None, cookie=True, host=None, origin="same", csrf="same",
+          content_type="application/json", path="/api/owner_reply", method="POST"):
+    import json
+    body = raw if raw is not None else json.dumps(payload).encode("utf-8")
+    hdrs = {}
+    if content_type is not None:
+        hdrs["Content-Type"] = content_type
+    if origin == "same":
+        hdrs["Origin"] = f"http://127.0.0.1:{c.server.port}"
+    elif origin is not None:
+        hdrs["Origin"] = origin
+    if csrf == "same":
+        hdrs["X-CSRF"] = c.server.csrf
+    elif csrf is not None:
+        hdrs["X-CSRF"] = csrf
+    hdrs.update(headers or {})
+    status, resp_headers, text = c.request(method, path, headers=hdrs, cookie=cookie, host=host, body=body)
+    return status, resp_headers, text
+
+
+GOOD_POST = {"id": "waiting", "nonce": NONCE, "text": "stop"}
+
+
+def test_owner_reply_endpoint_writes_exactly_one_small_file_and_nothing_else():
+    import json, pathlib, tempfile
+    from agent_loop import dashboard, mailbox
+    root = pathlib.Path(tempfile.mkdtemp())
+    _paused_fixture(root)
+    before = _tree(root)
+    with mock.patch.object(dashboard, "POST_INTERVAL", 0), _dashboard(root) as c:
+        status, headers, body = _post(c, GOOD_POST)
+        assert status == 200 and json.loads(body) == {"ok": True}, (status, body)
+        assert headers["x-content-type-options"] == "nosniff" and "access-control-allow-origin" not in headers
+        added = [row for row in _tree(root) if row not in before]
+        assert added == [("waiting/owner_reply.json", added[0][1])], added
+        assert json.loads((root / "waiting" / "owner_reply.json").read_text(encoding="utf-8")) == {"nonce": NONCE, "text": "stop"}
+        assert mailbox.consume_reply(root / "waiting", NONCE) == "stop"
+
+        # localhost is an equally valid origin; guidance text passes through unchanged
+        status, _, _ = _post(c, dict(GOOD_POST, text="Try a regex" + NL + "and keep the tests"), origin=f"http://localhost:{c.server.port}")
+        assert status == 200
+        assert mailbox.consume_reply(root / "waiting", NONCE) == "Try a regex" + NL + "and keep the tests"
+        # a later pause needs its own nonce
+        assert _post(c, {"id": "repaused", "nonce": "second-nonce-99", "text": "stop"})[0] == 200
+        assert (root / "repaused" / "owner_reply.json").exists()
+
+
+def test_owner_reply_endpoint_rejects_everything_else_and_changes_nothing():
+    import json, pathlib, tempfile
+    from agent_loop import dashboard, mailbox
+    root = pathlib.Path(tempfile.mkdtemp())
+    _paused_fixture(root)
+    big = json.dumps(dict(GOOD_POST, text="x" * 5000)).encode("utf-8")
+    cases = {
+        # who is asking
+        "no cookie": (dict(cookie=False), 403),
+        "wrong cookie": (dict(cookie=False, headers={"Cookie": "dash=wrong"}), 403),
+        "wrong host": (dict(host="evil.example"), 403),
+        "host without port": (dict(host="127.0.0.1"), 403),
+        "no origin": (dict(origin=None), 403),
+        "foreign origin": (dict(origin="http://evil.example"), 403),
+        "null origin": (dict(origin="null"), 403),
+        "origin with another port": (dict(origin="http://127.0.0.1:1"), 403),
+        "origin without port": (dict(origin="http://127.0.0.1"), 403),
+        "https origin": (dict(origin="https://127.0.0.1"), 403),
+        "no csrf header": (dict(csrf=None), 403),
+        "wrong csrf header": (dict(csrf="wrong"), 403),
+        "the login token is not the csrf token": (dict(csrf="testtoken"), 403),
+        # what is being sent
+        "text/plain body": (dict(content_type="text/plain"), 415),
+        "form body": (dict(content_type="application/x-www-form-urlencoded"), 415),
+        "no content type": (dict(content_type=None), 415),
+        "oversize body": (dict(raw=big), 413),
+        "empty body": (dict(raw=b""), 413),
+        "not json": (dict(raw=b"stop"), 400),
+        "json list": (dict(raw=b'["stop"]'), 400),
+        "json string": (dict(raw=b'"stop"'), 400),
+        "missing text": (dict(raw=json.dumps({"id": "waiting", "nonce": NONCE}).encode()), 400),
+        "number as nonce": (dict(raw=json.dumps({"id": "waiting", "nonce": 5, "text": "stop"}).encode()), 400),
+        "list as id": (dict(raw=json.dumps({"id": ["waiting"], "nonce": NONCE, "text": "stop"}).encode()), 400),
+        # which run, and whether it is waiting
+        "unknown run": (dict(payload=dict(GOOD_POST, id="nope")), 404),
+        "path traversal id": (dict(payload=dict(GOOD_POST, id="../waiting")), 404),
+        "encoded traversal id": (dict(payload=dict(GOOD_POST, id="%2e%2e/waiting")), 404),
+        "absolute id": (dict(payload=dict(GOOD_POST, id="/etc")), 404),
+        "empty id": (dict(payload=dict(GOOD_POST, id="")), 404),
+        "run that never paused": (dict(payload=dict(GOOD_POST, id="nopause")), 409),
+        "wrong nonce": (dict(payload=dict(GOOD_POST, nonce="wrong-nonce-123")), 409),
+        "nonce of an older pause": (dict(payload={"id": "repaused", "nonce": NONCE, "text": "stop"}), 409),
+        "pause already answered": (dict(payload=dict(GOOD_POST, id="answered")), 409),
+        "run already finished": (dict(payload=dict(GOOD_POST, id="finished")), 409),
+        "run that crashed": (dict(payload=dict(GOOD_POST, id="crashed")), 409),
+        # what is being said
+        "empty text": (dict(payload=dict(GOOD_POST, text="")), 400),
+        "blank text": (dict(payload=dict(GOOD_POST, text="   ")), 400),
+        "text too long": (dict(payload=dict(GOOD_POST, text="x" * 2001)), 400),
+        "control character": (dict(payload=dict(GOOD_POST, text="stop" + chr(0))), 400),
+        "escape sequence": (dict(payload=dict(GOOD_POST, text=chr(27) + "[2J")), 400),
+        # other doors stay shut
+        "other POST path": (dict(payload=GOOD_POST, path="/api/runs"), 405),
+        "POST to a static file": (dict(payload=GOOD_POST, path="/app.js"), 405),
+        "PUT": (dict(payload=GOOD_POST, method="PUT"), 405),
+        "DELETE": (dict(payload=GOOD_POST, method="DELETE"), 405),
+        "PATCH": (dict(payload=GOOD_POST, method="PATCH"), 405),
+    }
+    before = _tree(root)
+    with mock.patch.object(dashboard := __import__("agent_loop.dashboard", fromlist=["x"]), "POST_INTERVAL", 0), _dashboard(root) as c:
+        for name, (kwargs, expected) in cases.items():
+            kwargs = dict(kwargs)
+            payload = kwargs.pop("payload", GOOD_POST if "raw" not in kwargs else None)
+            status, headers, body = _post(c, payload, **kwargs)
+            assert status == expected, (name, status, body[:80])
+            assert _tree(root) == before, f"{name}: something was written"
+            assert not any(k.startswith("access-control") for k in headers), name
+
+        # a reply that is already waiting is never overwritten
+        assert _post(c, GOOD_POST)[0] == 200
+        first = (root / "waiting" / "owner_reply.json").read_bytes()
+        assert _post(c, dict(GOOD_POST, text="accept"))[0] == 409
+        assert (root / "waiting" / "owner_reply.json").read_bytes() == first
+        mailbox.clear(root / "waiting")
+        assert _tree(root) == before
+
+
+def test_owner_reply_endpoint_is_rate_limited_and_never_needs_a_get():
+    import pathlib, tempfile
+    from agent_loop import dashboard
+    root = pathlib.Path(tempfile.mkdtemp())
+    _paused_fixture(root)
+    with _dashboard(root) as c:
+        assert _post(c, dict(GOOD_POST, text=""))[0] == 400            # reaches validation: uses the slot
+        assert _post(c, dict(GOOD_POST, text=""))[0] == 429            # one attempt per second, valid or not
+        assert _post(c, GOOD_POST)[0] == 429
+        time.sleep(dashboard.POST_INTERVAL + 0.1)
+        assert _post(c, GOOD_POST)[0] == 200
+        assert c.request("GET", "/api/owner_reply")[0] == 404, "reading is not a way to write"
+        assert c.request("GET", "/api/owner_reply?id=waiting&nonce=" + NONCE + "&text=stop")[0] == 404
+        assert not any(p.name == "owner_reply.json" for p in (root / "nopause").iterdir())
+
+
+def test_answering_from_the_page_end_to_end_with_a_real_paused_run():
+    import json, pathlib, tempfile, threading
+    from agent_loop import dashboard
+    root = pathlib.Path(tempfile.mkdtemp())
+    forever = threading.Event()
+
+    def silent_terminal():
+        forever.wait(60)
+        raise EOFError
+
+    install(code=BROKEN)
+    with mock.patch.object(dashboard, "POST_INTERVAL", 0), mock.patch.object(cli, "_terminal", cli._Terminal(silent_terminal)), \
+            _dashboard(root) as c:
+        run = _RunInThread(task="is_palindrome", tests=checks.TESTS, thread="live", runs_dir=root)
+        try:
+            summary = _wait_for(lambda: next((r for r in c.get_json("/api/runs")[1]["runs"] if r["id"] == "live" and r["status"] == "paused"), None))
+            pause = next(e for e in c.get_json("/api/trace?id=live&after=0")[1]["events"] if e["event"] == "pause")
+            assert summary["status"] == "paused" and pause["nonce"]
+            assert _post(c, {"id": "live", "nonce": "not-the-nonce-00", "text": "stop"})[0] == 409
+            time.sleep(0.05)
+            assert run.thread.is_alive(), "a wrong answer does not end the run"
+            status, _, body = _post(c, {"id": "live", "nonce": pause["nonce"], "text": "stop"})
+            assert status == 200, body
+            values = run.join()
+        finally:
+            forever.set()
+        assert values["outcome"] == "stopped by owner: stop"
+        trace_events = c.get_json("/api/trace?id=live&after=0")[1]["events"]
+        assert next(e for e in trace_events if e["event"] == "owner_call")["source"] == "dashboard"
+        assert _post(c, {"id": "live", "nonce": pause["nonce"], "text": "stop"})[0] == 409, "an answered pause cannot be answered again"
+        assert next(r for r in c.get_json("/api/runs")[1]["runs"] if r["id"] == "live")["status"] == "finished"
+
+
+def test_the_page_has_exactly_one_way_to_write_and_it_is_the_owner_reply():
+    import pathlib, re
+    js = (pathlib.Path(__file__).resolve().parent / "agent_loop" / "web" / "app.js").read_text(encoding="utf-8")
+    assert len(re.findall(r"method:\s*\"POST\"", js)) == 1, "one POST in the whole page"
+    assert not re.search(r"method:\s*\"(PUT|DELETE|PATCH)\"", js)
+    assert js.count("/api/owner_reply") == 1 and "X-CSRF" in js and "same-origin" in js
+    assert len(re.findall(r"\bfetch\(", js)) == 2, "a read helper and the single write"
+    assert "localStorage" not in js and "sessionStorage" not in js and "document.cookie" not in js
+
+
+def test_tests_keep_their_scratch_files_inside_the_project():
+    made = pathlib.Path(tempfile.mkdtemp())
+    with tempfile.TemporaryDirectory() as other:
+        assert _SCRATCH in made.parents and _SCRATCH in pathlib.Path(other).parents, (made, other)
+    assert _REPO in _SCRATCH.parents and _SCRATCH.parent.name == ".scratch"
+    ignored = subprocess.run(["git", "check-ignore", "-q", str(_SCRATCH / "x")], cwd=_REPO)
+    assert ignored.returncode in (0, 128), "the scratch folder must be gitignored"  # 128: git absent / no repo
+
+
+def test_project_runs_refuse_to_make_a_workspace_nobody_looks_after():
+    install()
+    try:
+        cli.run("Fix add()", kind="project", project=str(_REPO), thread="orphan")
+    except ValueError as exc:
+        assert "runs_dir" in str(exc), exc
+    else:
+        raise AssertionError("a project run without a runs_dir must not invent a temp workspace")
 
 
 def test_non_cp1252_code_and_output_do_not_crash_the_check():

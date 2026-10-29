@@ -3,33 +3,66 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-loop dashboard</title>
+<title>agent-loop</title>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
 <header class="top">
-  <h1>agent-loop</h1>
-  <nav>
+  <div class="brand"><span class="logo" aria-hidden="true"></span>agent-loop</div>
+  <nav class="tabs" aria-label="views">
     <button id="tab-runs" class="tab on" type="button">Runs</button>
     <button id="tab-evals" class="tab" type="button">Evals</button>
   </nav>
   <span class="note">read-only &middot; this machine only</span>
+  <button id="help-btn" class="icon-btn" type="button" aria-label="keyboard shortcuts">?</button>
 </header>
 
 <main id="view-runs" class="split">
-  <aside id="run-list" aria-label="runs"></aside>
-  <section id="run-view">
-    <p class="muted">Pick a run on the left.</p>
+  <aside class="side" aria-label="runs">
+    <div class="side-tools">
+      <input id="run-search" type="search" placeholder="Search runs   ( / )" aria-label="search runs" autocomplete="off">
+      <div id="status-chips" class="chips" role="group" aria-label="filter by status"></div>
+    </div>
+    <div id="run-list"></div>
+  </aside>
+  <section id="run-view" class="content" aria-live="polite">
+    <div class="empty">
+      <h2>Pick a run</h2>
+      <p>Choose a run on the left to see every model call, the tests, the reviews and the patch as they happen.</p>
+    </div>
   </section>
 </main>
 
 <main id="view-evals" class="split" hidden>
-  <aside id="eval-list" aria-label="eval reports"></aside>
-  <section id="eval-view">
-    <p class="muted">Pick an eval report on the left. Tick two to compare them.</p>
+  <aside class="side" aria-label="eval reports">
+    <div class="side-tools"><p class="muted small">Tick two reports to compare them.</p></div>
+    <div id="eval-list"></div>
+  </aside>
+  <section id="eval-view" class="content">
+    <div class="empty">
+      <h2>Pick an eval report</h2>
+      <p>Pass rate per task, cost, and every attempt. Tick two reports to compare them.</p>
+    </div>
   </section>
 </main>
 
+<div id="help" class="overlay" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-label="keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys">
+      <dt>/</dt><dd>search runs</dd>
+      <dt>j &nbsp; k</dt><dd>next / previous run</dd>
+      <dt>1 &nbsp; 2 &nbsp; 3</dt><dd>timeline / charts / patch</dd>
+      <dt>e</dt><dd>expand or collapse every card</dd>
+      <dt>f</dt><dd>follow new events</dd>
+      <dt>?</dt><dd>this help</dd>
+      <dt>Esc</dt><dd>close, or leave a text box</dd>
+    </dl>
+    <button id="help-close" class="btn" type="button">Close</button>
+  </div>
+</div>
+
+<script src="/logic.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

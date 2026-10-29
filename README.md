@@ -115,26 +115,56 @@ requirements: ['six==1.17.0']       # optional; installed at image build time on
 
 ## Dashboard
 
-See what the models are doing, live:
+See what the models are doing, live, and answer a paused run from the page:
 
 ```powershell
 .\.venv\Scripts\python.exe -m agent_loop.dashboard    # prints a URL with a one-time token
 ```
 
-Open that URL in your browser. **Runs** lists every traced run and shows, as it happens,
-each model call with its full prompt and reply, tokens and seconds, the tests' output,
-reviews, pauses and the final patch. **Evals** shows eval reports (including one still
-running), per-attempt detail and a side-by-side comparison of any two.
+Open that URL in your browser. Press `?` on the page for the keyboard shortcuts.
 
-It is read-only and local: it listens on `127.0.0.1` only (there is no option to change
-that), requires the random token, rejects unexpected `Host` headers, answers `GET` only,
-sends no CORS headers, serves a page whose content-security-policy forbids inline script,
-makes no outside requests, and shows model output as plain text (a test fails if the page
-code ever uses `innerHTML` and friends). It serves only files under `runs/`.
+**Runs.** Search and filter by status. For one run you get a timeline of every model call
+(full prompt and reply, tokens, seconds), the tests' output, reviews, pauses and the final
+result, with filters (model calls, node results, pauses, only failures) and a search box.
+*Charts* shows time and tokens per role and node and a call-by-call strip. *Patch* shows the
+change as a unified or side-by-side diff. *Export report* downloads the run as Markdown.
+Eval attempts are hidden from the list by default (use the "eval attempts" chip).
 
-Runs write `runs/<thread>/trace.jsonl` (prompts and replies, with key-shaped strings
-redacted). Those files contain your project code, so they stay local and gitignored.
-Runs made before this feature have no trace; they still appear under Evals.
+**Evals.** Every report with its pass rate, per-task bars, a trend across reports, every
+attempt, and a comparison of any two ticked reports.
+
+**Deep links.** `#run=<id>`, `#run=<id>&view=charts` (or `patch`), `#eval=<report>.json`.
+
+**Answering a paused run.** When a run stops at the rejection cap and waits for you, the page
+shows the last review and test output with **Stop run**, **Accept anyway** (a second click
+confirms, and says if the tests failed) and a box for guidance. Your answer is used exactly
+like a line typed in the terminal (the exact-word `stop` / `accept` rule is unchanged), and
+whichever of the terminal or the page answers first wins. Evals never wait.
+
+### What the dashboard can and cannot do
+
+It is read-only with one exception, the owner reply:
+
+- Listens on `127.0.0.1` only (no option to change that); the port cannot be shared with
+  another program; every request needs the random per-launch token; unexpected `Host`
+  headers are refused; no CORS headers are ever sent.
+- The page makes no outside requests, loads no outside code, has a strict content-security
+  policy (no inline script or style), and shows model output as plain text. Tests fail if the
+  page code uses `innerHTML` and similar, references a remote address, or has more than the
+  single write below.
+- **The one write.** `POST /api/owner_reply` leaves a small file, `runs/<thread>/owner_reply.json`.
+  It is accepted only when ALL of these hold: login cookie, exact `Origin`, the per-launch CSRF
+  header, a JSON body of at most 4 KB, a run that is paused right now with that pause's random
+  nonce, reply text of 1-2000 characters with no control characters, no reply already waiting,
+  and at most one attempt per second. The run uses the reply once and deletes it. A reply for
+  another pause is discarded.
+- It cannot start or stop runs, run code, change `config.yaml`, or write anywhere else.
+- It serves only files under `runs/`, with names checked against a strict pattern.
+
+Runs write `runs/<thread>/trace.jsonl` (prompts and replies, key-shaped strings redacted).
+Those files contain your project code, so they stay local and gitignored. Runs made before
+tracing existed have no trace; they still appear under Evals. The page refreshes by polling
+every second or two. Stop the dashboard with Ctrl+C.
 
 ## Research mode
 
