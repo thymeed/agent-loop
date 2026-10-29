@@ -5,8 +5,8 @@ and a local Ollama model (`gemma3:4b`).
 
 - `lead` writes a short plan.
 - `worker` writes a solution (code in a fenced block).
-- `check` extracts that code and runs it in a subprocess against fixed asserts,
-  storing `tests_passed` / `test_output`.
+- `check` extracts that code and runs it in a Docker sandbox (see below) against fixed
+  asserts, storing `tests_passed` / `test_output`.
 - `reviewer` sees the task, solution, and real test results. A model "APPROVED"
   cannot override a failing run — `route` requires `tests_passed` to finish.
 - After 3 rejections the graph pauses at `ask_tai`. A reply that is *exactly*
@@ -41,8 +41,9 @@ check fails closed with an install hint.
 import paths: that code runs as your user with your files, environment and
 network. Use it only for trusted toy tasks.
 
-First run pulls the image: `docker pull python:3.12-slim`.
-
+The image is pulled on first use; to pre-pull: `docker pull python:3.12-slim`.
+The sandbox is exercised against real Docker by `_smoke_test.py` whenever the
+daemon is running (skipped otherwise).
 
 ## Layout
 
