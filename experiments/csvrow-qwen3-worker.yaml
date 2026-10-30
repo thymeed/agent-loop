@@ -1,0 +1,6 @@
+# csvrow "qwen3-worker" variant: the worker is qwen3:8b with its thinking switched off.
+models:
+  worker: "ollama:qwen3:8b"
+model_options:
+  worker:
+    reasoning: false

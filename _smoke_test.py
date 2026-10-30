@@ -2632,6 +2632,50 @@ def test_an_experiment_patch_layers_over_the_real_config_key_by_key():
         raise AssertionError("a missing patch must be an error, not a silent control run")
 
 
+def test_prompt_variants_are_whitelisted_and_checked():
+    import pathlib, tempfile
+    from agent_loop import config
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    base = "models:" + NL + "  worker: ollama:qwen2.5-coder:7b" + NL
+    assert config.load_config(_cfg(tmp, "pv0.yaml", base), env={})["prompt_variants"] == [], "the default is none"
+    ok = config.load_config(_cfg(tmp, "pv1.yaml", base + "prompt_variants: [real_path_example, no_plan]" + NL), env={})
+    assert ok["prompt_variants"] == ["real_path_example", "no_plan"], ok["prompt_variants"]
+    replaced = config.load_config(_cfg(tmp, "pv2.yaml", base + "prompt_variants: [no_plan]" + NL),
+                                  env={"AGENT_LOOP_CONFIG": str(_cfg(tmp, "pv3.yaml", "prompt_variants: [real_path_example]" + NL))})
+    assert replaced["prompt_variants"] == ["real_path_example"], "a patch's list replaces the file's list"
+    assert config.DEFAULTS["prompt_variants"] == [], "layering must never change the shared defaults"
+    for bad in ("prompt_variants: [no_plna]", "prompt_variants: [real_path_example, typo]",
+                "prompt_variants: real_path_example", "prompt_variants:", "prompt_variants: [1]",
+                "prompt_variants: [[no_plan]]", "prompt_variants: [null]"):
+        try:
+            config.load_config(_cfg(tmp, "pv-bad.yaml", base + bad + NL), env={})
+        except ValueError as exc:
+            assert "real_path_example" in str(exc) and "no_plan" in str(exc), exc
+        else:
+            raise AssertionError(f"accepted {bad}")
+
+
+def test_csvrow_experiment_patches_load_with_their_values():
+    import pathlib
+    from agent_loop import config
+    experiments = pathlib.Path(__file__).resolve().parent / "experiments"
+    base = config.load_config(config.CONFIG_PATH, env={})
+    want = {
+        "csvrow-path": {"prompt_variants": ["real_path_example"]},
+        "csvrow-noplan": {"prompt_variants": ["no_plan"]},
+        "csvrow-qwen3-worker": {"models": {"worker": "ollama:qwen3:8b"},
+                                "model_options": {"worker": {"reasoning": False}}},
+    }
+    for name, changes in want.items():
+        cfg = config.load_config(config.CONFIG_PATH, env={"AGENT_LOOP_CONFIG": str(experiments / f"{name}.yaml")})
+        assert cfg["override"] == f"{name}.yaml", name
+        assert cfg["prompt_variants"] == changes.get("prompt_variants", []), name
+        assert cfg["models"] == {**base["models"], **changes.get("models", {})}, name
+        assert cfg["model_options"] == {**base["model_options"], **changes.get("model_options", {})}, name
+        rest = {k: v for k, v in cfg.items() if k not in ("models", "model_options", "prompt_variants", "override")}
+        assert rest == {k: v for k, v in base.items() if k not in ("models", "model_options", "prompt_variants", "override")}, name
+
+
 def test_options_reach_only_the_roles_that_list_them_and_reports_record_them():
     from agent_loop import config
     thinker = config.make_llm("ollama:qwen3:8b", {"reasoning": False, "num_predict": 4096, "temperature": 0.1})
@@ -2646,6 +2690,29 @@ def test_options_reach_only_the_roles_that_list_them_and_reports_record_them():
     assert "override" in report["config"]
 
 
+def test_reports_record_the_prompt_variants_that_ran():
+    with _variants():
+        assert evals.new_report("plain", 1, None)["config"]["prompt_variants"] == [], "the default records none"
+    with _variants("no_plan"):
+        assert evals.new_report("csvrow", 1, None)["config"]["prompt_variants"] == ["no_plan"]
+
+
+def test_the_pre_run_line_names_prompt_variants_and_is_otherwise_unchanged():
+    nothing = {"model_options": {}, "override": None, "prompt_variants": []}
+    assert evals.config_line(nothing) == "", "nothing set: nothing printed"
+    patched = {"model_options": {"escalation": {"reasoning": False}}, "override": "think-off.yaml",
+               "prompt_variants": []}
+    assert evals.config_line(patched) == "options: {'escalation': {'reasoning': False}}   patch: think-off.yaml", \
+        "without variants the line is the old text exactly"
+    assert evals.config_line({"model_options": {}, "override": "x.yaml", "prompt_variants": []}) == \
+        "options: {}   patch: x.yaml"
+    variant = evals.config_line({"model_options": {}, "override": None, "prompt_variants": ["no_plan"]})
+    assert "prompt variants: ['no_plan']" in variant, variant
+    assert variant == "options: {}   patch: None   prompt variants: ['no_plan']", variant
+    both = evals.config_line({**patched, "prompt_variants": ["real_path_example", "no_plan"]})
+    assert both.endswith("   prompt variants: ['real_path_example', 'no_plan']"), both
+
+
 def test_the_shipped_experiment_files_change_only_what_they_say():
     import pathlib
     from agent_loop import config
@@ -2653,18 +2720,26 @@ def test_the_shipped_experiment_files_change_only_what_they_say():
     base = config.load_config(config.CONFIG_PATH, env={})
     results = {p.stem: config.load_config(config.CONFIG_PATH, env={"AGENT_LOOP_CONFIG": str(p)})
                for p in sorted(experiments.glob("*.yaml"))}
-    assert sorted(results) == ["control", "think-capped", "think-default", "think-off"], sorted(results)
+    assert sorted(results) == ["control", "csvrow-noplan", "csvrow-path", "csvrow-qwen3-worker",
+                               "think-capped", "think-default", "think-off"], sorted(results)
     # the adopted setting: the experiment found thinking off as good and about three times faster
     assert base["model_options"] == {"escalation": {"reasoning": False}}, base["model_options"]
+    assert base["prompt_variants"] == [], "the default has no prompt variant"
     for name, cfg in results.items():
-        assert cfg["models"] == base["models"], f"{name} must not change models"
-        assert {k: v for k, v in cfg.items() if k not in ("model_options", "override")} == \
-            {k: v for k, v in base.items() if k not in ("model_options", "override")}, f"{name} changes more than model options"
+        if name not in ("csvrow-path", "csvrow-noplan"):  # pinned exactly by the csvrow test above
+            assert cfg["prompt_variants"] == [], f"{name} must not switch on a prompt variant"
+        if name != "csvrow-qwen3-worker":
+            assert cfg["models"] == base["models"], f"{name} must not change models"
+        assert {k: v for k, v in cfg.items() if k not in ("model_options", "models", "prompt_variants", "override")} == \
+            {k: v for k, v in base.items() if k not in ("model_options", "models", "prompt_variants", "override")}, \
+            f"{name} changes more than model options, models and prompt variants"
     assert results["control"]["model_options"] == base["model_options"]
     assert results["think-off"]["model_options"]["escalation"] == {"reasoning": False}
     assert results["think-default"]["model_options"]["escalation"] == {"reasoning": None}, "re-creates the old control"
     assert results["think-capped"]["model_options"]["escalation"] == {"reasoning": True, "num_predict": 4096}
-    assert all(set(cfg["model_options"]) <= {"escalation"} for cfg in results.values()), "only the escalation role is touched"
+    assert all(set(cfg["model_options"]) <= {"escalation"} for name, cfg in results.items()
+               if not name.startswith("csvrow-")), "only the escalation role is touched"
+    assert set(results["csvrow-qwen3-worker"]["model_options"]) == {"escalation", "worker"}
 
 
 def test_strip_think_removes_reasoning_but_nothing_else():
@@ -2715,6 +2790,157 @@ def test_lead_and_reviewer_replies_are_read_without_their_reasoning():
     values = cli.run("is_palindrome", tests=checks.TESTS, thread="clean-roles")
     assert values["approved"] is True and values["plan"] == "1. The real plan", values
     assert values["review"].startswith("APPROVED"), values["review"]
+
+
+def _variants(*names):
+    """Pin the prompt switches for one block, so the suite never depends on AGENT_LOOP_CONFIG."""
+    return mock.patch.dict(agent_nodes.CONFIG, {"prompt_variants": list(names)})
+
+
+# The default prompts exactly as HEAD builds them (the same workspace and state as the test below).
+# A change to any character, including a trailing space, must show up here.
+PROJECT_WORKER_PROMPT = """Task: Fix parse_row
+Plan: 1. Fix it
+
+Project files:
+- tests/test_parse.py
+- csvrow/parse.py
+
+### tests/test_parse.py
+```
+from csvrow.parse import parse_row
+
+```
+
+### csvrow/parse.py
+```
+def parse_row(line):
+    return []
+
+```
+
+Last review: REJECTED: quoted fields are split at the comma
+Last test run:
+FAILED tests/test_parse.py::test_quoted - assert [] == ['a,b']
+
+Change the project so the task is done and its tests pass. Reply with one fenced block per file you change or create. The fence's info string is the file path and the block holds the COMPLETE new file, for example:
+```pkg/module.py
+<entire file>
+```
+Use paths relative to the project root, only files inside the project, and no other fenced blocks.
+Test files and test configuration (test_*.py, tests/, conftest.py, pytest.ini, pyproject.toml, ...) are read-only: fix the code so the existing tests pass."""
+
+CODE_WORKER_PROMPT = ("Task: is_palindrome" + NL + "Plan: 1. Clean the string" + NL + "2. Compare it reversed" + NL
+                      + "Last review: REJECTED: fails on the empty string" + NL + "Write the solution.")
+
+RESEARCH_WORKER_PROMPT = """Task: What do the papers show?
+Plan: 1. Read the abstracts
+Papers (your ONLY allowed source):
+[arXiv:2401.00001] A Paper (2024-01-02; A. One, B. Two, C. Three)
+Abstract: We show a result that is quoted exactly here.
+
+Last review: REJECTED: one claim has no quote
+Last citation check: unsupported claim
+Answer the task using only these papers. Support every claim by citing the paper as [arXiv:ID] and copying an exact phrase of at least 4 words from its abstract in double quotes in the same paragraph. Every paper you cite needs at least one such quote. Do not use outside knowledge and do not cite other papers."""
+
+
+def test_default_worker_prompt_and_lead_call_are_unchanged():
+    import pathlib, tempfile
+    ws = _project(pathlib.Path(tempfile.mkdtemp()) / "ws",
+                  {"csvrow/parse.py": "def parse_row(line):" + NL + "    return []" + NL,
+                   "tests/test_parse.py": "from csvrow.parse import parse_row" + NL})
+    state = {"task": "Fix parse_row", "plan": "1. Fix it", "type": "project", "workspace": str(ws),
+             "review": "REJECTED: quoted fields are split at the comma",
+             "test_output": "FAILED tests/test_parse.py::test_quoted - assert [] == ['a,b']"}
+    lead = SeqLLM(["1. Fix it"])
+    agent_nodes.MODELS["lead"] = lead
+    with _variants():
+        out = agent_nodes.lead({"task": "Fix parse_row"})
+        prompt = agent_nodes._worker_prompt(state)
+    assert lead.prompts == ["Task: Fix parse_row" + NL
+                            + "Write a short numbered plan (max 6 steps) to solve the task. No code, no preamble."], \
+        lead.prompts
+    assert lead.calls == 1 and out["plan"] == "1. Fix it" and out["tokens"]["lead"]["calls"] == 1, out
+    assert prompt == PROJECT_WORKER_PROMPT, prompt
+
+
+def test_code_and_research_worker_prompts_are_unchanged():
+    code ={"task": "is_palindrome", "plan": "1. Clean the string" + NL + "2. Compare it reversed",
+            "review": "REJECTED: fails on the empty string"}
+    sources = [{"id": "2401.00001", "title": "A Paper", "published": "2024-01-02",
+                "authors": ["A. One", "B. Two", "C. Three", "D. Four"],
+                "abstract": "We show a result that is quoted exactly here."}]
+    research_state = {"task": "What do the papers show?", "plan": "1. Read the abstracts", "type": "research",
+                      "review": "REJECTED: one claim has no quote", "test_output": "unsupported claim",
+                      "sources": sources}
+    with _variants():
+        assert agent_nodes._worker_prompt(code) == CODE_WORKER_PROMPT, agent_nodes._worker_prompt(code)
+        assert agent_nodes._worker_prompt(research_state) == RESEARCH_WORKER_PROMPT, \
+            agent_nodes._worker_prompt(research_state)
+
+
+def test_real_path_example_names_a_workspace_file_the_worker_may_edit():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    ws = _project(root / "ws", {"csvrow/parse.py": "def parse_row(line):" + NL + "    return []" + NL,
+                                "tests/test_parse.py": "from csvrow.parse import parse_row" + NL})
+    state = {"task": "Fix parse_row", "plan": "1. Fix it", "type": "project", "workspace": str(ws)}
+    with _variants():
+        default = agent_nodes._worker_prompt(state)
+    with _variants("real_path_example"):
+        prompt = agent_nodes._worker_prompt(state)
+    assert "```csvrow/parse.py" + NL in prompt and "pkg/module.py" not in prompt, prompt
+    assert "```tests/" not in prompt, "a test file is never the example"
+    assert prompt == default.replace("```pkg/module.py", "```csvrow/parse.py"), "only the example path may change"
+
+    # no non-protected .py file: the example falls back to the old placeholder
+    for i, files in enumerate([
+        {"tests/test_parse.py": "x" + NL, "conftest.py": "y" + NL, "README.md": "z" + NL},
+        {"tests/test_parse.py": "x" + NL, "notes.txt": "z" + NL},
+    ]):
+        empty = _project(root / f"fallback{i}", files)
+        with _variants("real_path_example"):
+            fallback = agent_nodes._worker_prompt({**state, "workspace": str(empty)})
+        assert "```pkg/module.py" + NL in fallback, fallback
+    # several candidates: the first in sorted order wins
+    many = _project(root / "many", {"zeta/app.py": "z = 1" + NL, "alpha/app.py": "a = 1" + NL})
+    with _variants("real_path_example"):
+        assert "```alpha/app.py" + NL in agent_nodes._worker_prompt({**state, "workspace": str(many)})
+    # an __init__.py is never the example, even when it sorts first (pkg/__init__.py < pkg/module.py)
+    pkg = _project(root / "pkg", {"pkg/__init__.py": "", "pkg/module.py": "x = 1" + NL})
+    with _variants("real_path_example"):
+        prompt = agent_nodes._worker_prompt({**state, "workspace": str(pkg)})
+    assert "```pkg/module.py" + NL in prompt and "```pkg/__init__.py" not in prompt, prompt
+    only_init = _project(root / "only-init", {"pkg/__init__.py": ""})
+    with _variants("real_path_example"):
+        assert "```pkg/module.py" + NL in agent_nodes._worker_prompt({**state, "workspace": str(only_init)})
+    # the real csvrow fixture: csvrow/__init__.py sorts before csvrow/parse.py and must not be the example
+    fixture = root / "csvrow-fixture"
+    shutil.copytree(_REPO / "evals" / "projects" / "csvrow", fixture)
+    with _variants("real_path_example"):
+        prompt = agent_nodes._worker_prompt({**state, "workspace": str(fixture)})
+    assert "```csvrow/parse.py" + NL in prompt and "```csvrow/__init__.py" not in prompt, prompt
+    with _variants():
+        assert "```pkg/module.py" + NL in agent_nodes._worker_prompt({**state, "workspace": str(fixture)})
+
+
+def test_no_plan_makes_no_lead_call_and_the_worker_is_told_none():
+    lead = SeqLLM(["1. Fix it"])
+    agent_nodes.MODELS["lead"] = lead
+    with _variants("no_plan"):
+        out = agent_nodes.lead({"task": "Fix it"})
+    assert lead.calls == 0, lead.calls
+    assert out["plan"] == "none" and out["tokens"] == {"lead": {"input": 0, "output": 0, "total": 0, "calls": 0}}, out
+    with _variants():
+        out = agent_nodes.lead({"task": "Fix it"})
+    assert lead.calls == 1 and out["plan"] == "1. Fix it", out
+    # a whole code task with the variant on: no lead call, the run still goes through and is approved
+    install()
+    lead = agent_nodes.MODELS["lead"]
+    with _variants("no_plan"):
+        values = cli.run("is_palindrome", tests=checks.TESTS, thread="no-plan")
+    assert lead.calls == 0 and values["plan"] == "none" and values["approved"] is True, values
+    assert values["tokens"]["lead"]["calls"] == 0, values["tokens"]
 
 
 def test_tests_keep_their_scratch_files_inside_the_project():

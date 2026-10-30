@@ -1,0 +1,2 @@
+# csvrow "path" variant: the worker's file-block example uses a real project path, not pkg/module.py.
+prompt_variants: [real_path_example]

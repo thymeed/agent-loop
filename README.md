@@ -195,6 +195,8 @@ harness checks first).
   `$env:AGENT_LOOP_CONFIG = "experiments\think-off.yaml"`. A patch cannot turn the sandbox off or
   use an unknown option. Per-role `model_options` allow `reasoning`, `num_predict` and
   `temperature` only; a thinking model's reasoning is stripped from its answer before use.
+  A patch may also set `prompt_variants` (`real_path_example`, `no_plan`), which switch on prompt
+  changes for experiments; an unknown name is an error, and the default is none.
 - **Fixtures are frozen on purpose.** `evals/projects/slugify` is a copy of `projects/slugify_demo`
   so editing the demo cannot change eval numbers. `evals/FIXTURES.sha256` pins everything under
   `evals/`; the test suite fails if a fixture changes until you run

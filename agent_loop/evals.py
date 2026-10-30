@@ -75,7 +75,8 @@ def new_report(label: str, attempts: int, budget: int | None) -> dict:
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "config": {"models": dict(CONFIG["models"]), "model_options": dict(CONFIG["model_options"]),
                    "override": CONFIG["override"], "num_ctx": CONFIG["num_ctx"],
-                   "max_rejections": CONFIG["max_rejections"], "sandbox": CONFIG["sandbox"]},
+                   "max_rejections": CONFIG["max_rejections"], "sandbox": CONFIG["sandbox"],
+                   "prompt_variants": list(CONFIG["prompt_variants"])},
         "attempts": attempts,
         "budget": budget,
         "finished": False,
@@ -211,6 +212,14 @@ def preflight() -> None:
                          + "  (ollama pull <name>, or edit the config)")
 
 
+def config_line(cfg: dict) -> str:
+    """The pre-run line naming the options, patch and prompt variants in force; "" when none is set."""
+    if not (cfg["model_options"] or cfg["override"] or cfg["prompt_variants"]):
+        return ""
+    variants = f"   prompt variants: {cfg['prompt_variants']}" if cfg["prompt_variants"] else ""
+    return f"options: {cfg['model_options']}   patch: {cfg['override']}{variants}"
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -235,8 +244,9 @@ def main() -> None:
     preflight()
     only = {n.strip() for n in args.only.split(",") if n.strip()} if args.only else None
     print(f"models: {CONFIG['models']}")
-    if CONFIG["model_options"] or CONFIG["override"]:
-        print(f"options: {CONFIG['model_options']}   patch: {CONFIG['override']}")
+    line = config_line(CONFIG)
+    if line:
+        print(line)
     report, path = run_eval(files, args.attempts, args.label, budget=args.budget, only=only)
     print("\n" + format_table(summarize(report["results"])))
     print(f"\nreport: {path.relative_to(runs.RUNS_DIR.parent)}")

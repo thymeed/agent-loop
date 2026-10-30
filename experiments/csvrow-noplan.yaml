@@ -1,0 +1,2 @@
+# csvrow "no-plan" variant: the lead makes no call and the worker gets no plan ("Plan: none").
+prompt_variants: [no_plan]

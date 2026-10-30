@@ -46,6 +46,8 @@ def answer_text(resp) -> str:
 
 
 def lead(s: State):
+    if "no_plan" in CONFIG["prompt_variants"]:  # experiment: the worker gets no plan, and no call is made
+        return {"plan": "none", "tokens": {"lead": {"input": 0, "output": 0, "total": 0, "calls": 0}}}
     msg = (
         f"Task: {s['task']}\n"
         "Write a short numbered plan (max 6 steps) to solve the task. "
@@ -107,6 +109,17 @@ def apply(s: State):
             "apply_errors": result.errors, "apply_notes": result.skipped}
 
 
+def _example_path(s: State) -> str:
+    """The file-block example's path: the first workspace .py file the worker may edit (not an
+    __init__.py), else pkg/module.py."""
+    if "real_path_example" in CONFIG["prompt_variants"]:
+        for name in workspace.project_files(Path(s["workspace"])):
+            if (name.endswith(".py") and Path(name).name != "__init__.py"
+                    and not workspace.is_protected(name, _protected(s))):
+                return name
+    return "pkg/module.py"
+
+
 def _worker_prompt(s: State) -> str:
     if is_project(s):
         context = workspace.build_context(Path(s["workspace"]), budget=CONFIG["max_context_chars"])
@@ -119,7 +132,7 @@ def _worker_prompt(s: State) -> str:
             "Change the project so the task is done and its tests pass. Reply with one fenced "
             "block per file you change or create. The fence's info string is the file path "
             "and the block holds the COMPLETE new file, for example:\n"
-            "```pkg/module.py\n<entire file>\n```\n"
+            f"```{_example_path(s)}\n<entire file>\n```\n"
             "Use paths relative to the project root, only files inside the project, and no "
             "other fenced blocks."
             + ("\nTest files and test configuration (test_*.py, tests/, conftest.py, pytest.ini, "

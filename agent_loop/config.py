@@ -15,6 +15,7 @@ DEFAULTS = {
         "reviewer": "ollama:qwen2.5-coder:7b",
     },
     "model_options": {},
+    "prompt_variants": [],
     "max_rejections": 3,
     "test_timeout": 15,
     "sandbox": "docker",
@@ -41,6 +42,10 @@ MODEL_OPTION_RULES = {
     "temperature": (lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 2,
                     "a number from 0 to 2"),
 }
+
+# Prompt changes that only an experiment patch switches on (`prompt_variants`). The default is none,
+# so the prompts are unchanged; an unknown name is an error, so a typo cannot measure the control.
+PROMPT_VARIANTS = ("real_path_example", "no_plan")
 
 
 def override_path(env=None) -> Path | None:
@@ -86,9 +91,19 @@ def _check_model_options(cfg: dict) -> None:
                 raise ValueError(f"model option {key!r} for {role!r} must be {wanted}, got {value!r}")
 
 
+def _check_prompt_variants(cfg: dict) -> None:
+    allowed = ", ".join(PROMPT_VARIANTS)
+    if not isinstance(cfg["prompt_variants"], list):
+        raise ValueError(f"prompt_variants must be a list of names (allowed: {allowed})")
+    for name in cfg["prompt_variants"]:
+        if not isinstance(name, str) or name not in PROMPT_VARIANTS:
+            raise ValueError(f"unknown prompt variant {name!r} (allowed: {allowed})")
+
+
 def load_config(path: Path = CONFIG_PATH, env=None) -> dict:
     cfg = {**DEFAULTS, "models": dict(DEFAULTS["models"]),
-           "model_options": {role: dict(o) for role, o in DEFAULTS["model_options"].items()}}
+           "model_options": {role: dict(o) for role, o in DEFAULTS["model_options"].items()},
+           "prompt_variants": list(DEFAULTS["prompt_variants"])}
     if path.exists():
         _layer(cfg, path)
     override = override_path(env)
@@ -96,6 +111,7 @@ def load_config(path: Path = CONFIG_PATH, env=None) -> dict:
         _layer(cfg, override)
     cfg["override"] = override.name if override else None
     _check_model_options(cfg)
+    _check_prompt_variants(cfg)
     if cfg["sandbox"] not in ("docker", "local"):
         raise ValueError(f"sandbox must be 'docker' or 'local', got {cfg['sandbox']!r}")
     if cfg["sandbox"] == "local" and (os.environ if env is None else env).get("AGENT_LOOP_ALLOW_LOCAL") != "1":
