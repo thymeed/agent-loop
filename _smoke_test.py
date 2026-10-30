@@ -557,6 +557,18 @@ def test_requirement_validation_rejects_anything_but_plain_specifiers():
     assert a == b and a != sandbox.image_tag(["a==2"]), "tag depends on the set, not the order"
 
 
+def test_requirement_validation_rejects_reserved_pytest_names():
+    assert sandbox.validate_requirements(["six==1.17.0", "pytest-cov", "pytest_mock>=3"])
+    for bad in ["pytest==8.0", "PyTest>=8", "pytest[testing]==8", "Pluggy==1.0", "_pytest",
+                "iniconfig==2.0", "Packaging>=20", "pygments", "pytest.", "pytest_", "Pluggy-==1",
+                "pygments.._-"]:
+        try:
+            sandbox.validate_requirements([bad])
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted reserved {bad!r}")
+
+
 def test_project_docker_command_is_locked_down_with_a_readonly_mount():
     import pathlib, tempfile
     ws = pathlib.Path(tempfile.mkdtemp())
@@ -639,6 +651,25 @@ def test_project_tests_build_once_fail_closed_and_kill_on_timeout():
     with _docker_mode(), mock.patch.object(sandbox.subprocess, "run", no_docker):
         ok, out = sandbox.run_project_tests(ws, "pytest", [])
     assert not ok and "install Docker" in out, out
+
+
+def test_build_context_is_made_under_the_project_scratch():
+    import pathlib
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")      # not built yet
+        ctx = pathlib.Path(cmd[-1])                                         # docker build ... <context>
+        seen["ctx"] = ctx
+        seen["present"] = [n for n in ("Dockerfile", "verify_pytest.py", "requirements.txt") if (ctx / n).is_file()]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with mock.patch.object(sandbox.subprocess, "run", fake_run):
+        sandbox.ensure_image(["six==1.17.0"])
+    assert seen["present"] == ["Dockerfile", "verify_pytest.py", "requirements.txt"], seen
+    assert seen["ctx"].parent == sandbox.SCRATCH and sandbox.SCRATCH == _REPO / ".scratch", seen
+    assert not seen["ctx"].exists(), "the build context is removed after the build"
 
 
 class SeqLLM:
@@ -2157,6 +2188,233 @@ def test_the_project_is_kept_off_the_front_of_the_python_path():
     assert re.search(r"install --no-cache-dir pytest==\d+\.\d+\.\d+", docker), "pytest must be pinned"
     assert "work.pth" in docker and "/work/src" in docker, "the project goes on the path through the image"
     assert "sitecustomize.py" in docker, "the image must occupy the sitecustomize name"
+
+
+def test_the_requirements_install_is_held_to_the_frozen_pytest_set():
+    import pathlib
+    docker = pathlib.Path(sandbox.DOCKERFILE).read_text(encoding="utf-8")
+    pin, freeze, snapshot, install = (docker.find(s) for s in (
+        "install --no-cache-dir pytest==9.2.0", "pip freeze > /tmp/constraints.txt",
+        "python -I -S /tmp/verify_pytest.py snapshot",
+        "pip install --no-cache-dir -c /tmp/constraints.txt -r /tmp/requirements.txt"))
+    assert -1 not in (pin, freeze, snapshot, install) and pin < freeze < snapshot < install, (
+        "freeze and snapshot the pytest set right after the pytest install, then install requirements with -c")
+
+
+def test_the_image_build_ends_by_verifying_the_pytest_set():
+    import pathlib, re
+    docker = pathlib.Path(sandbox.DOCKERFILE).read_text(encoding="utf-8")
+    steps = [line for line in docker.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    assert steps[-1] == "RUN python -I -S /tmp/verify_pytest.py check", (
+        "the last build step must check the pytest set against its snapshot, under -I -S", steps[-3:])
+    assert "python -I -S /tmp/verify_pytest.py snapshot" in docker, "the pytest set must be recorded after its install"
+    assert re.search(r"python -I -S -c \"import pathlib, site", docker), "the work.pth line must run under -I -S"
+    assert "COPY verify_pytest.py /tmp/verify_pytest.py" in docker, "the verifier must be copied into the image"
+    assert pathlib.Path(sandbox.VERIFIER).is_file(), "the build context is built from this file"
+
+
+def _copy_pytest_set(root, dest=None):
+    """A copy of this venv's pytest set laid out as RECORD describes it, plus a constraints file for it."""
+    import csv, importlib.metadata as md, os, pathlib, shutil
+    # RECORD rows may climb out of site-packages (console scripts), so the default leaves room for that
+    site = pathlib.Path(dest) if dest else root / "d" / "d" / "d" / "site"
+    constraints, lines = root / "constraints.txt", []
+    for name in ["pytest", "pluggy", "iniconfig", "packaging", "pygments"]:
+        dist = md.distribution(name)
+        lines.append(f"{name}=={dist.version}")
+        for row in csv.reader(dist.read_text("RECORD").splitlines()):
+            src = pathlib.Path(dist.locate_file(row[0]))
+            if src.is_file():
+                dst = pathlib.Path(os.path.normpath(site / row[0]))
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+    constraints.parent.mkdir(parents=True, exist_ok=True)
+    constraints.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return site, constraints
+
+
+def _verifier(mode, constraints, snapshot, site, python=None):
+    """The verifier the way the Dockerfile runs it (-I -S), against an explicit site directory."""
+    cmd = [python or sys.executable, "-I", "-S", str(sandbox.VERIFIER), mode, "--constraints", str(constraints),
+           "--snapshot", str(snapshot), "--site", str(site)]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _recorded(root, prepare=None):
+    """A copy of the pytest set with a snapshot of it, taken as the Dockerfile takes it: right after the
+    pytest install and before the requirements. prepare(site) may change the copy before the snapshot."""
+    site, constraints = _copy_pytest_set(root)
+    if prepare:
+        prepare(site)
+    snapshot = root / "snapshot.json"
+    made = _verifier("snapshot", constraints, snapshot, site)
+    assert made.returncode == 0, made.stderr
+    return site, constraints, snapshot
+
+
+def _pytest_dist_info(site):
+    return next(site.glob("pytest-*.dist-info"))
+
+
+def test_the_pytest_set_verifier_passes_clean_and_names_what_a_requirement_changed():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+
+    site, constraints, snap = _recorded(root / "clean")
+    ok = _verifier("check", constraints, snap, site)
+    assert ok.returncode == 0, ok.stderr
+
+    site, constraints, snap = _recorded(root / "clobbered")
+    (site / "_pytest" / "__init__.py").write_text('raise ImportError("CLOBBERED")' + NL, encoding="utf-8")
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and "_pytest/__init__.py: changed" in bad.stderr, bad.stderr
+
+    site, constraints, snap = _recorded(root / "added")
+    (site / "_pytest" / "extra_evil.py").write_text("x = 1" + NL, encoding="utf-8")
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and "_pytest/extra_evil.py: added" in bad.stderr, bad.stderr
+
+    site, constraints, snap = _recorded(root / "deleted")
+    (site / "pluggy" / "__init__.py").unlink()
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and "pluggy/__init__.py: missing" in bad.stderr, bad.stderr
+
+    site, constraints = _copy_pytest_set(root / "nopin")
+    constraints.write_text("pluggy==1.0\n", encoding="utf-8")
+    bad = _verifier("snapshot", constraints, root / "nopin" / "snapshot.json", site)
+    assert bad.returncode == 1 and "pins no pytest" in bad.stderr, bad.stderr
+
+
+def test_a_file_added_to_the_dist_info_folder_is_caught():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    site, constraints, snap = _recorded(root / "dist")
+    (_pytest_dist_info(site) / "entry_points_extra.txt").write_text("[console_scripts]" + NL, encoding="utf-8")
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and "entry_points_extra.txt: added" in bad.stderr, bad.stderr
+
+
+def test_a_forged_record_does_not_hide_a_changed_file():
+    """A wheel can ship its own RECORD. The check compares the disk with the snapshot, so a RECORD that
+    matches the altered file changes nothing."""
+    import base64, csv, hashlib, io, pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    site, constraints, snap = _recorded(root / "forged")
+    target = site / "_pytest" / "__init__.py"
+    target.write_text('raise ImportError("FORGED")' + NL, encoding="utf-8")
+    data = target.read_bytes()
+    sha = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+    record = _pytest_dist_info(site) / "RECORD"
+    rows = [["_pytest/__init__.py", f"sha256={sha}", str(len(data))] if row[:1] == ["_pytest/__init__.py"] else row
+            for row in csv.reader(record.read_text(encoding="utf-8").splitlines())]
+    text = io.StringIO()
+    csv.writer(text, lineterminator="\n").writerows(rows)
+    record.write_text(text.getvalue(), encoding="utf-8")
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and "_pytest/__init__.py: changed" in bad.stderr, bad.stderr
+
+
+def test_bytecode_is_checked_like_any_other_file():
+    """A .pyc has no hash in RECORD, so it is checked against the snapshot; a new one is an addition."""
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    pyc = pathlib.PurePosixPath("_pytest/__pycache__/__init__.cpython-312.pyc")
+
+    def plant(site):
+        (site / pyc.parent).mkdir(exist_ok=True)
+        (site / pyc).write_bytes(b"genuine")
+
+    site, constraints, snap = _recorded(root / "replaced", plant)
+    (site / pyc).write_bytes(b"CLOBBERED")
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and f"{pyc}: changed" in bad.stderr, bad.stderr
+
+    site, constraints, snap = _recorded(root / "added")
+    (site / "_pytest" / "__pycache__").mkdir(exist_ok=True)
+    (site / "_pytest" / "__pycache__" / "junk.cpython-312.pyc").write_bytes(b"junk")
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and "_pytest/__pycache__/junk.cpython-312.pyc: added" in bad.stderr, bad.stderr
+
+
+def _plant_listed_top_level_pyc(site):
+    """pytest ships a top-level py.py, so its RECORD lists __pycache__/py.cpython-312.pyc."""
+    (site / "__pycache__").mkdir(exist_ok=True)
+    (site / "__pycache__" / "py.cpython-312.pyc").write_bytes(b"genuine")
+    record = _pytest_dist_info(site) / "RECORD"
+    record.write_text(record.read_text(encoding="utf-8").rstrip(NL) + NL + "__pycache__/py.cpython-312.pyc,," + NL,
+                      encoding="utf-8")
+
+
+def test_a_top_level_module_does_not_make_the_shared_pycache_a_watched_folder():
+    """The shared top-level __pycache__ is no dist's own folder, so a requirement's top-level module and its
+    .pyc there are not additions to pytest's set."""
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    site, constraints, snap = _recorded(root / "shared", _plant_listed_top_level_pyc)
+    (site / "six.py").write_text("__version__ = '1.17.0'" + NL, encoding="utf-8")
+    (site / "__pycache__" / "six.cpython-312.pyc").write_bytes(b"six")
+    ok = _verifier("check", constraints, snap, site)
+    assert ok.returncode == 0, ok.stderr
+
+
+def test_a_listed_pyc_in_the_shared_pycache_is_still_checked():
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    site, constraints, snap = _recorded(root / "changed", _plant_listed_top_level_pyc)
+    (site / "__pycache__" / "py.cpython-312.pyc").write_bytes(b"CLOBBERED")
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and "__pycache__/py.cpython-312.pyc: changed" in bad.stderr, bad.stderr
+
+
+def test_a_listed_file_outside_site_packages_is_checked_too():
+    import csv, os, pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    site, constraints, snap = _recorded(root / "script")
+    listed = [os.path.normpath(site / row[0]) for row in csv.reader(
+        _pytest_dist_info(site).joinpath("RECORD").read_text(encoding="utf-8").splitlines())
+        if row and row[0].startswith("..")]
+    victim = next(path for path in listed if os.path.isfile(path))  # a console script, e.g. Scripts/pytest.exe
+    pathlib.Path(victim).write_bytes(b"CLOBBERED")
+    key = pathlib.PurePath(os.path.relpath(victim, site)).as_posix()
+    bad = _verifier("check", constraints, snap, site)
+    assert bad.returncode == 1 and f"{key}: changed" in bad.stderr, bad.stderr
+
+
+def test_a_pth_file_cannot_fake_a_pass_under_dash_s():
+    """Python runs .pth files in site-packages at start-up unless -S is given. A .pth in a venv that exits 0
+    fakes a pass for a check run without -S, and the same check run with -S still fails."""
+    import pathlib, tempfile
+    root = pathlib.Path(tempfile.mkdtemp())
+    venv = root / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    purelib = subprocess.run([str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    site, constraints = _copy_pytest_set(root / "pth", pathlib.Path(purelib))
+    snap = root / "pth" / "snapshot.json"
+    made = _verifier("snapshot", constraints, snap, site, python=str(python))
+    assert made.returncode == 0, made.stderr
+    (site / "_pytest" / "__init__.py").write_text('raise ImportError("CLOBBERED")' + NL, encoding="utf-8")
+    (site / "evil.pth").write_text(
+        'import os, sys; sys.argv[0].endswith("verify_pytest.py") and os._exit(0)' + NL, encoding="utf-8")
+    fooled = subprocess.run([str(python), "-I", str(sandbox.VERIFIER), "check", "--constraints", str(constraints),
+                             "--snapshot", str(snap), "--site", str(site)], capture_output=True, text=True)
+    assert fooled.returncode == 0, "the planted .pth must fake a pass without -S, or this test proves nothing"
+    bad = _verifier("check", constraints, snap, site, python=str(python))
+    assert bad.returncode == 1 and "_pytest/__init__.py: changed" in bad.stderr, bad.stderr
+
+
+def test_the_image_tag_follows_the_verifier_script():
+    import pathlib, tempfile
+    script = pathlib.Path(tempfile.mkdtemp()) / "verify_pytest.py"
+    text = pathlib.Path(sandbox.VERIFIER).read_text(encoding="utf-8").replace("\r\n", "\n")
+    script.write_bytes(text.encode("utf-8"))
+    with mock.patch.object(sandbox, "VERIFIER", script):
+        tag = sandbox.image_tag(["six==1.17.0"])
+        script.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+        assert sandbox.image_tag(["six==1.17.0"]) == tag, "a Windows checkout (CRLF) must name the same image"
+        script.write_bytes((text + "# an edit" + NL).encode("utf-8"))
+        assert sandbox.image_tag(["six==1.17.0"]) != tag, "editing the verifier must build a new image"
 
 
 def test_the_image_tag_follows_the_dockerfile():

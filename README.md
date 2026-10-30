@@ -147,13 +147,26 @@ requirements: ['six==1.17.0']       # optional; installed at image build time on
   A bad path fails the lap; nothing from that reply is tested.
 - Tests run with `pytest` (`python -I -m pytest`, pinned in the image) in the Docker sandbox:
   workspace mounted read-only, no network. Packages in `requirements:` are installed while the
-  image is built, never at test time. Only `pytest` commands get the `-I` treatment; another
-  `test_command` still runs, but without that protection.
-- **The worker cannot edit the tests.** `test_*.py`, `tests/`, `conftest.py`, `pytest.ini`,
-  `pyproject.toml` and similar are protected: edits to them are ignored (the rest of the
-  reply still counts) and checked again by content before every test run. Add globs with
-  `protected: [...]`, or turn it off with `allow_test_edits: true` for tasks that need
-  new tests.
+  image is built, never at test time, and they are code that runs inside the image. `pytest` and
+  its dependencies (`pluggy`, `iniconfig`, `packaging`, `pygments`) are reserved there (any
+  spelling is refused), since the image holds them fixed. Only `pytest` is pinned to a version;
+  its dependencies are frozen at the versions pip resolved right after installing it, and the
+  requirements install is held to those, so a requirement that needs another one fails the build
+  rather than replacing it. The build context is made under `.scratch/`, never the system temp.
+  The build also runs `sandbox/verify_pytest.py`: it records pytest's files right after that
+  install and fails the build if a requirement, by accident, overwrites pytest's or its
+  dependencies' files, or adds a file to their own package or dist-info folders (pip overwrites
+  silently). A new file at the top level of site-packages is not seen, including a new top-level
+  module and its `.pyc` in the shared `__pycache__`. It is NOT a defence against a hostile
+  package, which can run code in every test process through a `.pth` file (even under `-I`) and
+  can shadow pytest from the interpreter's stdlib directory. Only `pytest` commands get the `-I`
+  treatment; another `test_command` still runs, but without that protection.
+- **The worker cannot edit the tests.** This exists because it happened: in live runs the worker
+  rewrote the tests it was being graded on, so a "pass" meant nothing. Do not loosen it to save a
+  retry. `test_*.py`, `tests/`, `conftest.py`, `pytest.ini`, `pyproject.toml` and similar are
+  protected: edits to them are ignored (the rest of the reply still counts) and checked again by
+  content before every test run. Add globs with `protected: [...]`, or turn it off with
+  `allow_test_edits: true` for tasks that need new tests.
 - The result is `runs/<thread>/changes.patch`. Review it, then `git apply` it yourself
   from the project directory.
 - Limits: Python and pytest only; small models often fail the whole-file format on
@@ -316,13 +329,19 @@ Model-written code is the threat. These layers apply on every run:
    first and force a pass. Those names, `_pytest/` and `*.pth` are also protected. A test plants
    exactly those files in a real container, checks the verdict is still the real one, and checks
    the same files DO fool the old command, so the test can fail. The image tag includes the
-   Dockerfile, so editing it rebuilds the image instead of reusing a stale one.
+   Dockerfile and its verifier, so editing either rebuilds the image instead of reusing a stale one.
+
+Known limit of item 8: a hostile requirement can still shadow pytest from the interpreter's stdlib
+directory, or run code in every test through a `.pth` file. The build check catches accidents only.
 
 What this does not give you: a container shares a kernel with its host (Docker
 Desktop's WSL2 VM, here), so an escape is unlikely but not impossible. The image
 build step has network access (that is where `requirements:` are installed). Stronger
 isolation is outside this repo: run everything in a dedicated WSL2 distro with the
-Windows drives and interop turned off, ideally with rootless Docker.
+Windows drives and interop turned off, ideally with rootless Docker. The code under
+test runs in the same process as pytest and can patch it, so a pass is evidence only
+for code you trust enough to run; the sandbox and protected tests limit this but do
+not remove it.
 
 ## Layout
 
@@ -333,5 +352,7 @@ Windows drives and interop turned off, ideally with rootless Docker.
   traces (`runs.py`, `trace.py`, `mailbox.py`), evals (`evals.py`, `fixtures.py`) and the dashboard
   (`dashboard.py` with `web/`).
 - `tasks/`, `projects/` — example tasks and the demo project. `evals/` — frozen eval fixtures.
-  `experiments/` — config patches for evals. `sandbox/Dockerfile` — the project test image.
+  `experiments/` — config patches for evals. `sandbox/Dockerfile` — the project test image, and
+  `sandbox/verify_pytest.py` — snapshots pytest's files after its install and checks them at the
+  end of the build.
 - `_smoke_test.py`, `jstests/` — Python and page-logic tests.

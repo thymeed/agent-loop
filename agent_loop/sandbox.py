@@ -16,6 +16,8 @@ from . import checks
 from .config import CONFIG
 
 DOCKERFILE = Path(__file__).resolve().parent.parent / "sandbox" / "Dockerfile"
+VERIFIER = Path(__file__).resolve().parent.parent / "sandbox" / "verify_pytest.py"  # the image's last build step
+SCRATCH = Path(__file__).resolve().parent.parent / ".scratch"  # build contexts go here, never the system temp
 BUILD_TIMEOUT = 600
 UNSAFE_MOUNT_CHARS = (",", '"', "'", chr(10), chr(13))
 OUTPUT_TAIL = 3000
@@ -25,6 +27,17 @@ OUTPUT_TAIL = 3000
 _VERSION = r"(?:==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9.*+!_-]+"
 _REQUIREMENT = re.compile(
     rf"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._-]+\])?(?:\s*{_VERSION}(?:\s*,\s*{_VERSION})*)?$")
+# pytest and its unconditional runtime deps, from the image's pytest 9.2.0 metadata (importlib.metadata
+# requires(), with extras and marker-gated deps left out). The image holds them fixed; a requirement
+# naming one would replace a fixed package that decides every verdict.
+_RESERVED = frozenset({"pytest", "pluggy", "iniconfig", "packaging", "pygments"})
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _canonical(requirement: str) -> str:
+    """PEP 503 name of a requirement: no extras or versions, lowercase, runs of -_. as one '-'."""
+    name = _NAME.match(requirement.strip()).group(0)
+    return re.sub(r"[-_.]+", "-", name).lower().strip("-")
 
 
 class SandboxError(RuntimeError):
@@ -35,14 +48,21 @@ def validate_requirements(requirements: list[str]) -> list[str]:
     bad = [r for r in requirements if not isinstance(r, str) or not _REQUIREMENT.match(r.strip())]
     if bad:
         raise ValueError(f"not a plain requirement specifier (name plus optional versions): {bad}")
+    reserved = [r for r in requirements if _canonical(r) in _RESERVED]
+    if reserved:
+        raise ValueError(f"reserved name, the sandbox holds pytest and its dependencies fixed: {reserved}")
     return [r.strip() for r in requirements]
 
 
+def _text_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()  # CRLF == LF
+
+
 def image_tag(requirements: list[str]) -> str:
-    """Names the image by what is in it: the base, the Dockerfile and the requirements, so editing
-    the Dockerfile builds a fresh image instead of silently reusing a stale one."""
-    recipe = hashlib.sha256(DOCKERFILE.read_bytes().replace(b"\r\n", b"\n")).hexdigest()  # CRLF == LF
-    key = "\n".join([CONFIG["sandbox_image"], recipe, *sorted(requirements)])
+    """Names the image by what is in it: the base, the Dockerfile, the verifier it runs and the
+    requirements, so editing either file builds a fresh image instead of silently reusing a stale one."""
+    key = "\n".join([CONFIG["sandbox_image"], _text_digest(DOCKERFILE), _text_digest(VERIFIER),
+                     *sorted(requirements)])
     return "agent-loop-proj-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
@@ -53,8 +73,10 @@ def ensure_image(requirements: list[str]) -> str:
     try:
         if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode == 0:
             return tag
-        with tempfile.TemporaryDirectory() as ctx:
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as ctx:
             shutil.copy(DOCKERFILE, Path(ctx) / "Dockerfile")
+            shutil.copy(VERIFIER, Path(ctx) / "verify_pytest.py")
             (Path(ctx) / "requirements.txt").write_text("\n".join(requirements) + "\n", encoding="utf-8")
             print(f"building sandbox image {tag} (requirements: {requirements or 'none'}) ...")
             build = subprocess.run(
