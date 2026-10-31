@@ -75,7 +75,7 @@ runs (its original report, written under 6 tests, says 2/10; attempt #10 had a d
 
 Reports: `runs/evals/csvrow-control-20261030-215034-e2f3.json`, `csvrow-path-20261030-230447-375b.json`,
 `csvrow-noplan-20261030-231214-ce6e.json`, `csvrow-qwen3-worker-20261030-231652-60ac.json`.
-Every failure ended at the rejection cap (recorded as `capped`).
+Every failure ended at the rejection cap (recorded as `capped`; the control's original report predates the rename and records those stops as "stopped by owner").
 
 Secondary measure (first worker reply applied at least one file block, wrong-path files included):
 control 9/10, path 10/10, no-plan 10/10, qwen3-worker 10/10. The stray `pkg/csvrow/parse.py` write that
