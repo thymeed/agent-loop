@@ -29,7 +29,8 @@ _REQUIREMENT = re.compile(
     rf"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._-]+\])?(?:\s*{_VERSION}(?:\s*,\s*{_VERSION})*)?$")
 # pytest and its unconditional runtime deps, from the image's pytest 9.2.0 metadata (importlib.metadata
 # requires(), with extras and marker-gated deps left out). The image holds them fixed; a requirement
-# naming one would replace a fixed package that decides every verdict.
+# naming one would replace a fixed package that decides every verdict. The list assumes the image's
+# Python 3.12; recheck it when the base image or the pytest pin changes.
 _RESERVED = frozenset({"pytest", "pluggy", "iniconfig", "packaging", "pygments"})
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 

@@ -816,8 +816,7 @@ def test_project_hard_gate_survives_an_approving_reviewer():
 
 def test_real_docker_project_run_end_to_end_with_fake_models():
     import pathlib, tempfile
-    if not _docker_up():
-        print("  (docker not available - skipped)")
+    if not _require_docker():
         return
     root = pathlib.Path(tempfile.mkdtemp())
     with _docker_mode():
@@ -1305,8 +1304,7 @@ def test_self_check_runs_first_once_and_blocks_model_code_when_broken():
 
 
 def test_real_docker_self_check_passes_and_really_detects_a_weak_container():
-    if not _docker_up():
-        print("  (docker not available - skipped)")
+    if not _require_docker():
         return
     with _docker_mode(verified=False):
         ok, msg = checks.verify_sandbox()
@@ -2474,8 +2472,7 @@ def test_a_repeat_limit_abort_is_retried_once_but_other_unknown_errors_are_not()
 def test_real_docker_planted_startup_code_cannot_fake_a_pass_but_the_old_command_could():
     """The attack: files in the project that load before pytest and force a green result."""
     import pathlib, tempfile
-    if not _docker_up():
-        print("  (docker not available - skipped)")
+    if not _require_docker():
         return
     root = pathlib.Path(tempfile.mkdtemp())
     files = {
@@ -2978,11 +2975,22 @@ def _docker_up():
         ["docker", "info"], capture_output=True).returncode == 0
 
 
+def _require_docker():
+    """True when Docker is up. Down is a failure, so a green run means the sandbox was exercised;
+    AGENT_LOOP_SKIP_DOCKER=1 is the explicit offline opt-out."""
+    if _docker_up():
+        return True
+    if os.environ.get("AGENT_LOOP_SKIP_DOCKER") == "1":
+        print("  (docker not available - skipped)")
+        return False
+    raise AssertionError("Docker is not running: the real-Docker tests would be skipped, not passed "
+                         "(set AGENT_LOOP_SKIP_DOCKER=1 to skip on purpose)")
+
+
 def test_real_docker_project_sandbox():
     """Fixture project: fails, passes after a fix, cannot write to /work, needs no network."""
     import pathlib, tempfile
-    if not _docker_up():
-        print("  (docker not available - skipped)")
+    if not _require_docker():
         return
     root = pathlib.Path(tempfile.mkdtemp())
     ws = _project(root / "ws", {
@@ -3062,11 +3070,8 @@ def test_missing_docker_fails_closed():
 
 
 def test_real_docker_sandbox_blocks_network_and_files():
-    """Runs only when Docker is up; otherwise a no-op so the suite stays offline."""
-    import shutil
-    if not shutil.which("docker") or subprocess.run(
-            ["docker", "info"], capture_output=True).returncode != 0:
-        print("  (docker not available - skipped)")
+    """Real Docker: no network, no writes. Fails when Docker is down unless AGENT_LOOP_SKIP_DOCKER=1."""
+    if not _require_docker():
         return
     probe = (
         "import socket, os\n"
