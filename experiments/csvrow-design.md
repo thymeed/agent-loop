@@ -61,3 +61,29 @@ the traces; if the traces do not expose it cleanly, say so and report "not measu
 ## Report
 One line per variant: passes/10, d, mean seconds, errors, outcome from the table. Nulls are reported
 the same as wins. Reports go to `runs/evals/` with labels `csvrow-<id>`.
+
+## Results (added 2026-10-30; the rule above is unchanged)
+All four ran on the 11-test fixture. The control was re-scored from its saved code with no new model
+runs (its original report, written under 6 tests, says 2/10; attempt #10 had a doubled-quote bug).
+
+| Variant | Passes /10 | d | Mean s | Errors | Outcome |
+|---|---|---|---|---|---|
+| control (re-scored) | 1 | - | 29 | 0 | - |
+| path | 1 | 0 | 32 | 0 | DROP |
+| no-plan | 0 | -1 | 27 | 0 | DROP |
+| qwen3-worker | 0 | -1 | 53 | 0 | DROP |
+
+Reports: `runs/evals/csvrow-control-20261030-215034-e2f3.json`, `csvrow-path-20261030-230447-375b.json`,
+`csvrow-noplan-20261030-231214-ce6e.json`, `csvrow-qwen3-worker-20261030-231652-60ac.json`.
+Every failure ended at the rejection cap (recorded as `capped`).
+
+Secondary measure (first worker reply applied at least one file block, wrong-path files included):
+control 9/10, path 10/10, no-plan 10/10, qwen3-worker 10/10. The stray `pkg/csvrow/parse.py` write that
+the prompt's example path invites happened in 3/10 control attempts and 0/10 path attempts.
+
+Conclusion: no variant is shown to help, so none is a candidate and nothing changes in the defaults.
+Moving the example path removed the stray-file failure but not the low pass rate, and dropping the plan
+or switching the worker to qwen3:8b did not help either. With 10 attempts per variant a difference of one
+attempt is noise (the table's own note: one flip moves a variant 10 points). The likely limit is the model
+size (4B lead, 7B coder), but this experiment did not test that directly. Not pinned on purpose: csvrow
+quoting cases the task text does not decide (a quote inside an unwrapped field, text after a closing quote).
