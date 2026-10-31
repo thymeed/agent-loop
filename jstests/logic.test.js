@@ -119,6 +119,14 @@ check("outcome and category classify items", () => {
   assert.equal(L.category(items[1]), "llm");
 });
 
+check("replyTitle words a flag stop as automatic, never as an owner reply", () => {
+  assert.equal(L.replyTitle("flag"), "Automatic reply · flag");
+  assert.equal(L.replyTitle("terminal"), "Owner replied · terminal");
+  assert.equal(L.replyTitle("dashboard"), "Owner replied · dashboard");
+  assert.equal(L.replyTitle(undefined), "Owner replied · terminal");
+  assert.equal(L.replyTitle(""), "Owner replied · terminal");
+});
+
 check("filterItems: kinds, only failures and text search (case-insensitive, searches prompts and replies)", () => {
   const items = L.buildItems(EVENTS);
   assert.equal(L.filterItems(items, {}).length, items.length);

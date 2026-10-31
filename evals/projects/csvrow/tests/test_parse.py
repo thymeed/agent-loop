@@ -23,3 +23,23 @@ def test_quoted_empty_field():
 
 def test_spaces_are_kept():
     assert parse_row(" a , b ") == [" a ", " b "]
+
+
+def test_comma_after_doubled_quote_that_ends_field():
+    assert parse_row('"a""",b') == ['a"', "b"]
+
+
+def test_doubled_quote_then_comma_inside_quotes():
+    assert parse_row('"a"",b"') == ['a",b']
+
+
+def test_field_that_is_only_an_escaped_quote():
+    assert parse_row('""""') == ['"']
+
+
+def test_doubled_quote_at_start_of_quoted_field():
+    assert parse_row('"""a",b') == ['"a', "b"]
+
+
+def test_quoted_empty_field_then_trailing_empty_field():
+    assert parse_row('a,"",') == ["a", "", ""]

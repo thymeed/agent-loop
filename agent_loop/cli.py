@@ -235,9 +235,10 @@ def _wait_for_owner(thread_dir: Path, nonce: str) -> tuple[str, str]:
             return text, "dashboard"
 
 
-def _ask_owner(resume_with: str | None, thread_dir: Path | None, nonce: str | None) -> str:
+def _ask_owner(resume_with: str | None, thread_dir: Path | None, nonce: str | None) -> str | dict:
     """The owner's call at a pause, from --resume, the terminal, or (with a runs folder) the dashboard.
-    The text is used exactly like terminal input, so ask_tai's exact stop/accept rule is unchanged."""
+    The text is used exactly like terminal input, so ask_tai's exact stop/accept rule is unchanged.
+    Only a flag answer comes back wrapped with its source, so ask_tai can record an automatic stop as capped."""
     if resume_with is not None:
         answer, source = resume_with, "flag"
     elif thread_dir is None or nonce is None:
@@ -245,7 +246,7 @@ def _ask_owner(resume_with: str | None, thread_dir: Path | None, nonce: str | No
     else:
         answer, source = _wait_for_owner(thread_dir, nonce)
     trace.emit("owner_call", text=trace.clean(answer, 500), source=source)
-    return answer
+    return {"text": answer, "source": source} if source == "flag" else answer
 
 
 def expand_task_files(paths: list[str]) -> list[str]:

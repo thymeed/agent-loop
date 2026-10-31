@@ -186,7 +186,9 @@ def render_report(ident: str, events: list[dict], patch: str | None) -> str:
             lines += [f"### {number}. paused for the owner", "",
                       _block(json.dumps(e.get("info", {}), indent=2, ensure_ascii=False), "json")]
         elif kind == "owner_call":
-            lines += [f"### {number}. owner replied ({e.get('source', 'terminal')})", "", _block(e.get("text", ""))]
+            source = e.get("source", "terminal")
+            who = "automatic reply" if source == "flag" else "owner replied"
+            lines += [f"### {number}. {who} ({source})", "", _block(e.get("text", ""))]
         else:
             lines += [f"### {number}. run crashed", "", _block(e.get("error", ""))]
     if patch:

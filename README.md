@@ -34,7 +34,7 @@ Needs Ollama (with the models above pulled) and Docker running.
 ```powershell
 .\.venv\Scripts\python.exe loop.py                      # built-in palindrome task, interactive owner call
 .\.venv\Scripts\python.exe loop.py tasks/fizzbuzz.yaml   # your own task (see below)
-.\.venv\Scripts\python.exe loop.py --cap --resume stop   # force the cap, then end as owner
+.\.venv\Scripts\python.exe loop.py --cap --resume stop   # force the cap, then end as capped (not an owner stop)
 .\.venv\Scripts\python.exe loop.py --max-pauses 1        # pause once and exit
 .\.venv\Scripts\python.exe -m pytest _smoke_test.py -q   # tests: fake models, no Ollama; Docker tests run if Docker is up
 node jstests\logic.test.js                               # the dashboard page's logic (needs Node)

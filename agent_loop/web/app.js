@@ -358,7 +358,7 @@
         return card(it, "pause", "Paused for the owner (#" + it.number + ")", "",
           Object.entries(it.info || {}).filter(([k]) => k !== "options").flatMap(([k, v]) => block(k, typeof v === "string" ? v : JSON.stringify(v))), true);
       case "owner":
-        return card(it, "pause", "Owner replied · " + it.source, "", block("reply", it.text), true);
+        return card(it, "pause", L.replyTitle(it.source), "", block("reply", it.text), true);
       case "end": {
         const kids = [el("p", {}, "result: " + it.result + " · rejections " + it.rejections + " · pauses " + it.pauses)];
         if (it.changed.length) kids.push(...block("changed files", it.changed.join("\n")));

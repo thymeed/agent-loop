@@ -143,6 +143,12 @@
     return items;
   }
 
+  // Title for an owner_call. A flag answer is an automatic stop at the rejection cap, not an owner's reply.
+  function replyTitle(source) {
+    const s = String(source || "terminal");
+    return s === "flag" ? "Automatic reply · flag" : "Owner replied · " + s;
+  }
+
   const CATEGORY = { llm: "llm", node: "node", pause: "pause", owner: "pause", resumed: "pause", start: "run", end: "run", crash: "run" };
   const category = (item) => CATEGORY[item.kind] || "run";
 
@@ -294,6 +300,6 @@
     return Math.round(n / 1000) + "k";
   }
 
-  return { parseDiff, sideBySide, buildItems, category, outcome, itemText, filterItems, runStats, niceMax,
+  return { parseDiff, sideBySide, buildItems, replyTitle, category, outcome, itemText, filterItems, runStats, niceMax,
     barGeometry, timelineSpans, trendPoints, matchRun, sortRuns, formatSeconds, formatCount };
 });

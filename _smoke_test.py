@@ -175,12 +175,76 @@ def test_cap_run_does_not_leak_tests_into_later_runs():
     install()
     stopped = cli.run("is_palindrome", tests=checks.IMPOSSIBLE_TESTS,
                        resume_with="stop", thread="leak")
-    assert stopped["outcome"].startswith("stopped by owner")
+    assert stopped["outcome"].startswith("capped")  # resume_with is the flag path: an automatic stop
     assert checks.TESTS == before, checks.TESTS
 
     install()
     passed = cli.run("is_palindrome", thread="leak-after")
     assert passed["approved"] is True and passed["tests_passed"] is True
+
+
+def test_flag_stop_at_the_cap_is_capped_not_an_owner_stop():
+    """--resume and the eval harness answer the cap with 'stop' on the owner's behalf: a capped run."""
+    import pathlib, tempfile
+    from agent_loop import runs
+    install()
+    run = cli.run("is_palindrome", tests=checks.IMPOSSIBLE_TESTS, resume_with="stop", thread="flag-capped")
+    assert run["outcome"].startswith("capped: hit the cap"), run["outcome"]
+    assert runs.result_label(run) == "capped" and not run["approved"], run
+
+    # the eval harness's own pass rule: a capped attempt is a failure, and it is labelled capped
+    install()
+    result = evals.run_attempt("capped", Task("is_palindrome", tests=checks.IMPOSSIBLE_TESTS), 1,
+                               "stamp", pathlib.Path(tempfile.mkdtemp()), None)
+    assert result["result"] == "capped" and result["passed"] is False, result
+
+
+def test_owner_stop_is_still_an_owner_stop():
+    """A plain 'stop' resumed straight into the graph (as a typed or dashboard reply arrives) is the owner's."""
+    from agent_loop import runs
+    for i, reply in enumerate(("stop", "Stop.")):
+        install()
+        _, state = drive(f"owner-stop-{i}", resume=reply)
+        assert state.values["outcome"].startswith("stopped by owner: "), state.values["outcome"]
+        assert runs.result_label(state.values) == "stopped by owner", state.values
+
+
+def test_flag_accept_is_unchanged():
+    from agent_loop import runs
+    install()
+    run = cli.run("is_palindrome", tests=checks.IMPOSSIBLE_TESTS, resume_with="accept", thread="flag-accept")
+    assert run["outcome"] == "accepted by owner despite failing checks: accept", run["outcome"]
+    assert runs.result_label(run) == "accepted by owner despite failing checks", run
+
+
+def test_typed_text_cannot_claim_the_capped_label():
+    """Only the flag can stop as capped: words that spell the label are ordinary guidance."""
+    for i, typed in enumerate(("capped", "Capped.", "capped: hit the cap, auto-stopped", "auto-stopped")):
+        install()
+        nodes, state = drive(f"typed-capped-{i}", resume=typed, stop_after_pauses=2)
+        assert nodes.count("__interrupt__") == 2, (typed, nodes)
+        assert state.values.get("outcome") is None, (typed, state.values)
+
+
+def test_flag_stop_survives_the_sqlite_checkpointer_on_continue():
+    import json, pathlib, tempfile
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    d = pathlib.Path(tempfile.mkdtemp())
+    db = str(d / "c.sqlite")
+
+    install()
+    with SqliteSaver.from_conn_string(db) as saver:
+        app = graph_mod.compile_graph(saver)
+        cli.run("is_palindrome", tests=checks.IMPOSSIBLE_TESTS, max_pauses=1, thread="t", app=app)
+
+    install()
+    with SqliteSaver.from_conn_string(db) as saver:
+        app = graph_mod.compile_graph(saver)
+        done = cli.run(None, thread="t", app=app, continue_thread=True,
+                       resume_with="stop", runs_dir=d / "runs")
+    assert done["outcome"].startswith("capped: hit the cap"), done
+    rec = json.loads((d / "runs" / "t.json").read_text(encoding="utf-8"))
+    assert rec["result"] == "capped", rec
 
 
 def test_load_task_file():
@@ -310,7 +374,7 @@ def test_research_run_end_to_end_with_fakes():
         worker, _ = install(code=fabricated, review="APPROVED: looks great")
         run = cli.run("Survey SSMs", kind="research", query="ssm",
                       resume_with="stop", thread="research-bad")
-        assert not run["approved"] and run["outcome"].startswith("stopped by owner"), run
+        assert not run["approved"] and run["outcome"].startswith("capped"), run  # flag path: automatic stop
         assert "quote not found" in run["test_output"], run
         assert worker.calls == agent_nodes.MAX_REJECTIONS, worker.calls
 
@@ -333,7 +397,7 @@ def test_run_survives_restart_via_sqlite():
         app = graph_mod.compile_graph(saver)
         done = cli.run(None, thread="t", app=app, continue_thread=True,
                        resume_with="stop", runs_dir=d / "runs")
-        assert done["outcome"].startswith("stopped by owner"), done
+        assert done["outcome"].startswith("capped"), done  # resume_with is the flag path: automatic stop
         try:
             cli.run(None, thread="t", app=app, continue_thread=True)
         except SystemExit as exc:
@@ -342,7 +406,7 @@ def test_run_survives_restart_via_sqlite():
             raise AssertionError("a finished thread must not resume")
 
     rec = json.loads((d / "runs" / "t.json").read_text(encoding="utf-8"))
-    assert rec["result"] == "stopped by owner" and rec["rejections"] == agent_nodes.MAX_REJECTIONS, rec
+    assert rec["result"] == "capped" and rec["rejections"] == agent_nodes.MAX_REJECTIONS, rec  # flag path
     assert rec["tokens"]["lead"]["calls"] == 1, rec["tokens"]  # the first run's lead call survived
     assert rec["tokens"]["worker"]["calls"] == agent_nodes.MAX_REJECTIONS, rec["tokens"]
 
@@ -810,7 +874,7 @@ def test_project_hard_gate_survives_an_approving_reviewer():
     still_broken = FENCE + "calc.py" + NL + "def add(a, b):" + NL + "    return a * b" + NL + FENCE
     with mock.patch.object(agent_nodes.sandbox, "run_project_tests", _fake_project_tests([])):
         _, values = _project_run(root, worker=SeqLLM([still_broken]), resume_with="stop")
-    assert not values["approved"] and values["outcome"].startswith("stopped by owner"), values
+    assert not values["approved"] and values["outcome"].startswith("capped"), values  # resume_with: flag path
     assert values["rejections"] == agent_nodes.MAX_REJECTIONS
 
 
@@ -1130,7 +1194,7 @@ def test_run_eval_end_to_end_with_fake_models_and_no_leaked_paths():
     assert good["total_tokens"] == 45 and good["result"] == "approved" and not good["escalated"], good
     assert {"lead", "worker", "check", "reviewer"} <= set(good["node_seconds"]), good["node_seconds"]
     bad = next(x for x in report["results"] if x["task"] == "bad")
-    assert bad["result"] == "stopped by owner" and bad["laps"] == agent_nodes.MAX_REJECTIONS, bad
+    assert bad["result"] == "capped" and bad["laps"] == agent_nodes.MAX_REJECTIONS, bad  # run_eval: flag path
 
     assert path.parent == tmp / "out" and path.name.startswith("unit-test--"), path
     saved = json.loads(path.read_text(encoding="utf-8"))
@@ -1403,7 +1467,7 @@ def test_trace_covers_pauses_owner_calls_errors_and_turns_off_afterwards():
     kinds = [e["event"] for e in _events(root, "capped")]
     assert "pause" in kinds and "owner_call" in kinds and kinds[-1] == "run_end", kinds
     assert kinds.index("pause") < kinds.index("owner_call") < kinds.index("run_end")
-    assert _events(root, "capped")[-1]["result"] == "stopped by owner"
+    assert _events(root, "capped")[-1]["result"] == "capped"  # _traced_run resumes with the flag
     assert trace._sink is None, "the sink is released after a run"
 
     class Boom:
@@ -1683,6 +1747,24 @@ def test_export_keeps_every_model_written_byte_inside_a_code_fence():
     for marker in ("HOSTILE", "<script>", "fake heading", "javascript:", "alert(1)"):
         assert marker not in outside, f"{marker!r} escaped its code fence"
     assert "# Run demo_x" in outside and "stopped by owner" in outside
+
+
+def test_report_calls_a_flag_stop_automatic_and_only_real_owner_replies_owner():
+    from agent_loop import dashboard
+    events = [
+        {"ts": 1.0, "event": "run_start", "kind": "code", "task": "t", "models": {}},
+        {"ts": 2.0, "event": "owner_call", "text": "stop", "source": "flag"},
+        {"ts": 3.0, "event": "owner_call", "text": "stop", "source": "terminal"},
+        {"ts": 4.0, "event": "owner_call", "text": "stop", "source": "dashboard"},
+        {"ts": 5.0, "event": "owner_call", "text": "stop"},
+        {"ts": 6.0, "event": "run_end", "result": "capped", "rejections": 3, "pauses": 0},
+    ]
+    report = dashboard.render_report("demo/x", events, None)
+    assert "### 1. automatic reply (flag)" in report, report
+    assert "owner replied (flag)" not in report, report
+    assert "### 2. owner replied (terminal)" in report, report
+    assert "### 3. owner replied (dashboard)" in report, report
+    assert "### 4. owner replied (terminal)" in report, report
 
 
 def test_dashboard_export_session_and_eval_stats_endpoints():
@@ -2118,6 +2200,13 @@ def test_the_page_has_exactly_one_way_to_write_and_it_is_the_owner_reply():
     assert js.count("/api/owner_reply") == 1 and "X-CSRF" in js and "same-origin" in js
     assert len(re.findall(r"\bfetch\(", js)) == 2, "a read helper and the single write"
     assert "localStorage" not in js and "sessionStorage" not in js and "document.cookie" not in js
+
+
+def test_the_page_takes_the_reply_title_from_logic_js():
+    import pathlib
+    js = (pathlib.Path(__file__).resolve().parent / "agent_loop" / "web" / "app.js").read_text(encoding="utf-8")
+    assert js.count("L.replyTitle(it.source)") == 1, "the card title comes from logic.js replyTitle"
+    assert "Owner replied" not in js, "that wording lives only in logic.js"
 
 
 class _ServerError(Exception):

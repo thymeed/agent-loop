@@ -247,6 +247,9 @@ def reviewer(s: State):
     }
 
 
+CAPPED_OUTCOME = "capped: hit the cap, auto-stopped"
+
+
 def ask_tai(s: State):
     choice = interrupt({
         "review": s["review"],
@@ -255,12 +258,19 @@ def ask_tai(s: State):
         "options": "reply exactly 'stop' or 'accept' to end the run; "
                    "anything longer is guidance and retries",
     })
-    text = (choice or "").strip()
+    # --resume and the eval harness answer with {"text", "source": "flag"}; a typed or dashboard
+    # reply is a plain string, so no owner's words can set the source.
+    if isinstance(choice, dict):
+        text, flagged = (choice.get("text") or "").strip(), choice.get("source") == "flag"
+    else:
+        text, flagged = (choice or "").strip(), False
     cmd = text.lower().strip(" .!?")
     plan = s["plan"] + "\nOwner call: " + text
 
     # Whole-reply match only: "accept the assert for now" is guidance, not a decision.
     if cmd in STOP_WORDS:
+        if flagged:  # an automatic stop at the cap, not the owner deciding
+            return {"plan": plan, "outcome": CAPPED_OUTCOME}
         return {"plan": plan, "outcome": f"stopped by owner: {text}"}
     if cmd in ACCEPT_WORDS:
         return {"plan": plan, "outcome": f"accepted by owner despite failing checks: {text}"}

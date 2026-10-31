@@ -27,6 +27,11 @@ Reading `nodes.py` showed the lead's prompt already says "No code, no preamble",
 have measured nothing new. The owner replaced it with `no-plan`, which tests the diagnosis finding
 that the plan can mislead the worker. Nothing else changed.
 
+Change note, 2026-10-30, after control attempt #10: the csvrow tests were extended from 6 to 11.
+Attempt #10 passed with a doubled-quote bug (`"a"",b"` came back split). The earlier 0 of 18 attempts
+used the 6-test version; a stricter test file cannot turn those failures into passes, so 0/18 stays
+valid. The control is to be re-scored against the new tests, with no new model runs.
+
 ## Sample
 10 attempts per variant, `--only csvrow --attempts 10`: 40 attempts, about 33 minutes per variant at
 the roughly 200 s a csvrow attempt took in the baseline. Run one variant at a time.
